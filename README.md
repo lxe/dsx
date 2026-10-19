@@ -53,7 +53,7 @@ Thinking is on by default; `"reasoning_effort": "none"` or `"thinking": {"type":
 |---|---|
 | GPU | NVIDIA, 24 GB+ (sm_86 or sm_120), CUDA 13 |
 | Memory | ~140 GB of VRAM + RAM for the experts |
-| CPU | x86 with AVX2 (AVX-VNNI preferred) |
+| CPU | x86 with AVX2 (AVX-VNNI or AVX-512 VNNI preferred) |
 | Disk | ~350 GB: the quant (148 GB) + the Engram shards (203 GB) |
 | Build | Rust stable |
 

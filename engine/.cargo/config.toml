@@ -1,2 +1,4 @@
 [build]
-rustflags = ["-C", "target-cpu=alderlake"]
+# native: the CPU that builds is the one that runs it (on an i7-12700K this is alderlake). A fixed newer target
+# lets the compiler emit AVX-VNNI anywhere, and the binary stops with SIGILL on Xeons and AMD CPUs.
+rustflags = ["-C", "target-cpu=native"]

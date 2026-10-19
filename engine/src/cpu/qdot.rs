@@ -1,4 +1,5 @@
-//! CPU expert matvec: int8 activations (256-blocks) x GGUF weight rows, AVX2 + AVX-VNNI.
+//! CPU expert matvec: int8 activations (256-blocks) x GGUF weight rows, AVX2 with AVX-VNNI, AVX-512 VNNI or neither
+//! (`isa`, picked once at run time).
 //! Rows are read once and used for up to 8 token vectors (verify batches).
 //!
 //! Per-format activation layouts (built once per token, so weights need no shuffles):
@@ -215,8 +216,11 @@ impl QActRaw {
     pub unsafe fn quantize_block(&self, tok: usize, blk: usize, x: &[f32]) {
         let x: &[f32; QK] = x.try_into().unwrap();
         #[cfg(target_arch = "x86_64")]
-        if simd_ok() {
-            return unsafe { self.quantize_block_avx2(tok, blk, x) };
+        match isa() {
+            Isa::Vnni => return unsafe { vnni::quantize_block(self, tok, blk, x) },
+            Isa::Vnni512 => return unsafe { vnni512::quantize_block(self, tok, blk, x) },
+            Isa::Avx2 => return unsafe { avx2::quantize_block(self, tok, blk, x) },
+            Isa::Scalar => {}
         }
         unsafe { self.quantize_block_scalar(tok, blk, x) }
     }
@@ -264,99 +268,6 @@ impl QActRaw {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-impl QActRaw {
-    #[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-    unsafe fn quantize_block_avx2(&self, tok: usize, blk: usize, x: &[f32; QK]) {
-        let xp = x.as_ptr();
-        let mut m = _mm256_setzero_ps();
-        let sign = _mm256_set1_ps(-0.0);
-        for i in 0..QK / 8 {
-            m = _mm256_max_ps(m, _mm256_andnot_ps(sign, unsafe { _mm256_loadu_ps(xp.add(8 * i)) }));
-        }
-        let m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
-        let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
-        let amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_movehdup_ps(m2)));
-        let d = amax / 127.0;
-        let id = _mm256_set1_ps(if d > 0.0 { 1.0 / d } else { 0.0 });
-        let e0 = tok * self.n + blk * QK;
-        let ones = _mm256_set1_epi8(1);
-        unsafe {
-            *self.d.add(e0 / QK) = d;
-            let q = self.q.add(e0);
-            let fix = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-            for g in 0..QK / 32 {
-                // cvtps rounds to nearest even (MXCSR default), like round_ties_even
-                let c = |k: usize| _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xp.add(32 * g + 8 * k)), id));
-                let ab = _mm256_packs_epi32(c(0), c(1));
-                let cd = _mm256_packs_epi32(c(2), c(3));
-                let v = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(ab, cd), fix);
-                _mm256_storeu_si256(q.add(32 * g) as *mut __m256i, v);
-                // per-16 sums: sad of q + 128 over 8 bytes
-                let sad = _mm256_sad_epu8(_mm256_xor_si256(v, _mm256_set1_epi8(-128)), _mm256_setzero_si256());
-                let mut e = [0u64; 4];
-                _mm256_storeu_si256(e.as_mut_ptr() as *mut __m256i, sad);
-                *self.s16.add(e0 / 16 + 2 * g) = (e[0] + e[1]) as i16 - 2048;
-                *self.s16.add(e0 / 16 + 2 * g + 1) = (e[2] + e[3]) as i16 - 2048;
-            }
-            if self.layouts & L_Q2 != 0 {
-                // per 128: 4x4 byte transpose in each 16-byte group, then a 4x4 dword transpose
-                let t4 = _mm256_setr_epi8(
-                    0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7,
-                    11, 15,
-                );
-                for h in 0..2 {
-                    let src = q.add(128 * h);
-                    let v: [__m256i; 4] = std::array::from_fn(|g| {
-                        let lo = _mm_loadu_si128(src.add(16 * g) as *const __m128i);
-                        let hi = _mm_loadu_si128(src.add(64 + 16 * g) as *const __m128i);
-                        _mm256_shuffle_epi8(_mm256_set_m128i(hi, lo), t4)
-                    });
-                    let t0 = _mm256_unpacklo_epi32(v[0], v[1]);
-                    let t1 = _mm256_unpacklo_epi32(v[2], v[3]);
-                    let t2 = _mm256_unpackhi_epi32(v[0], v[1]);
-                    let t3 = _mm256_unpackhi_epi32(v[2], v[3]);
-                    let p = [
-                        _mm256_unpacklo_epi64(t0, t1),
-                        _mm256_unpackhi_epi64(t0, t1),
-                        _mm256_unpacklo_epi64(t2, t3),
-                        _mm256_unpackhi_epi64(t2, t3),
-                    ];
-                    let dst = self.q2.add(e0 + 128 * h);
-                    let mut s = _mm256_setzero_si256();
-                    for k in 0..4 {
-                        _mm256_storeu_si256(dst.add(32 * k) as *mut __m256i, p[k]);
-                        s = _mm256_dpbusd_avx_epi32(s, ones, p[k]);
-                    }
-                    let neg = _mm256_sub_epi32(_mm256_setzero_si256(), s);
-                    _mm256_storeu_si256(self.q2n.add((e0 + 128 * h) / 16) as *mut __m256i, neg);
-                }
-            }
-            if self.layouts & L_T1 != 0 {
-                for h in 0..2 {
-                    let src = q.add(128 * h);
-                    let b128 = (e0 + 128 * h) / 128;
-                    let dst = self.t1.add(b128 * 160);
-                    let mut s = _mm256_setzero_si256();
-                    for n in 0..5 {
-                        let lo = _mm_loadu_si128(src.add(16 * n) as *const __m128i);
-                        let mut hi = _mm_loadl_epi64(src.add(80 + 8 * n) as *const __m128i);
-                        if n < 4 {
-                            let w = std::ptr::read_unaligned(src.add(120 + 2 * n) as *const i16);
-                            hi = _mm_insert_epi16(hi, w as i32, 4);
-                        }
-                        let p = _mm256_set_m128i(hi, lo);
-                        _mm256_storeu_si256(dst.add(32 * n) as *mut __m256i, p);
-                        s = _mm256_dpbusd_avx_epi32(s, ones, p);
-                    }
-                    let neg = _mm256_sub_epi32(_mm256_setzero_si256(), s);
-                    _mm256_storeu_si256(self.t1n.add(b128 * 8) as *mut __m256i, neg);
-                }
-            }
-        }
-    }
-}
-
 /// neg[l] = -(sum of bytes 4l..4l+4 of every 32-byte plane)
 fn dword_neg_sums(planes: &[i8], neg: &mut [i32]) {
     neg.fill(0);
@@ -375,20 +286,58 @@ struct Tok {
     d: *const f32,
 }
 
-pub fn simd_ok() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::sync::OnceLock;
-        static OK: OnceLock<bool> = OnceLock::new();
-        *OK.get_or_init(|| {
-            is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("avxvnni")
-                && is_x86_feature_detected!("fma")
-                && is_x86_feature_detected!("f16c")
-        })
+/// The CPU kernels' instruction set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Isa {
+    /// AVX2 + AVX-VNNI (Alder Lake and later desktops)
+    Vnni,
+    /// AVX2 + AVX-512 VNNI on ymm (Ice Lake and later Xeons, Zen 4/5)
+    Vnni512,
+    /// AVX2 alone (Zen 2/3, Haswell to Comet Lake)
+    Avx2,
+    Scalar,
+}
+
+impl Isa {
+    pub fn supported(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let base = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c");
+            match self {
+                Isa::Vnni => base && is_x86_feature_detected!("avxvnni"),
+                Isa::Vnni512 => base && is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl"),
+                Isa::Avx2 => base,
+                Isa::Scalar => true,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        matches!(self, Isa::Scalar)
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    false
+}
+
+/// The best supported instruction set; DSX_CPU_ISA=vnni|avx512vnni|avx2|scalar picks a lower one.
+pub fn isa() -> Isa {
+    use std::sync::OnceLock;
+    static ISA: OnceLock<Isa> = OnceLock::new();
+    *ISA.get_or_init(|| {
+        let all = [Isa::Vnni, Isa::Vnni512, Isa::Avx2, Isa::Scalar];
+        let want = match std::env::var("DSX_CPU_ISA").as_deref() {
+            Ok("vnni") => Some(Isa::Vnni),
+            Ok("avx512vnni") => Some(Isa::Vnni512),
+            Ok("avx2") => Some(Isa::Avx2),
+            Ok("scalar") => Some(Isa::Scalar),
+            _ => None,
+        };
+        let isa = want.filter(|i| i.supported()).unwrap_or_else(|| all.into_iter().find(|i| i.supported()).unwrap());
+        if isa != Isa::Vnni {
+            eprintln!("cpu kernels: {isa:?}");
+        }
+        isa
+    })
+}
+
+pub fn simd_ok() -> bool {
+    isa() != Isa::Scalar
 }
 
 /// out[j][r] = row r . token j, for all act.t tokens; rows = contiguous rows of `cols` weights.
@@ -400,6 +349,11 @@ pub fn dot_rows(ty: GType, rows: &[u8], cols: usize, act: &QAct, out: &mut [f32]
 
 /// out[j * ostride + r] = row r . token toks[j].
 pub fn dot_rows_sel(ty: GType, rows: &[u8], cols: usize, act: &QAct, toks: &[usize], out: &mut [f32], ostride: usize) {
+    dot_rows_isa(isa(), ty, rows, cols, act, toks, out, ostride)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dot_rows_isa(isa: Isa, ty: GType, rows: &[u8], cols: usize, act: &QAct, toks: &[usize], out: &mut [f32], ostride: usize) {
     let rb = ty.row_bytes(cols);
     assert!(rows.len() % rb == 0 && act.n == cols);
     let nr = rows.len() / rb;
@@ -407,7 +361,7 @@ pub fn dot_rows_sel(ty: GType, rows: &[u8], cols: usize, act: &QAct, toks: &[usi
         return;
     }
     assert!(out.len() >= (toks.len() - 1) * ostride + nr && ostride >= nr);
-    if !simd_ok() {
+    if isa == Isa::Scalar {
         return dot_rows_scalar(ty, rows, cols, act, toks, out, ostride);
     }
     #[cfg(target_arch = "x86_64")]
@@ -422,19 +376,28 @@ pub fn dot_rows_sel(ty: GType, rows: &[u8], cols: usize, act: &QAct, toks: &[usi
             *p = act.tok(t, ty);
         }
         let o = out[c * MAX_T * ostride..].as_mut_ptr();
-        macro_rules! go {
-            ($f:ident) => {
+        macro_rules! run {
+            ($m:ident, $f:ident) => {
                 unsafe {
                     match tc.len() {
-                        1 => $f::<1>(rows, nr, cols, &tp, o, ostride),
-                        2 => $f::<2>(rows, nr, cols, &tp, o, ostride),
-                        3 => $f::<3>(rows, nr, cols, &tp, o, ostride),
-                        4 => $f::<4>(rows, nr, cols, &tp, o, ostride),
-                        5 => $f::<5>(rows, nr, cols, &tp, o, ostride),
-                        6 => $f::<6>(rows, nr, cols, &tp, o, ostride),
-                        7 => $f::<7>(rows, nr, cols, &tp, o, ostride),
-                        _ => $f::<8>(rows, nr, cols, &tp, o, ostride),
+                        1 => $m::$f::<1>(rows, nr, cols, &tp, o, ostride),
+                        2 => $m::$f::<2>(rows, nr, cols, &tp, o, ostride),
+                        3 => $m::$f::<3>(rows, nr, cols, &tp, o, ostride),
+                        4 => $m::$f::<4>(rows, nr, cols, &tp, o, ostride),
+                        5 => $m::$f::<5>(rows, nr, cols, &tp, o, ostride),
+                        6 => $m::$f::<6>(rows, nr, cols, &tp, o, ostride),
+                        7 => $m::$f::<7>(rows, nr, cols, &tp, o, ostride),
+                        _ => $m::$f::<8>(rows, nr, cols, &tp, o, ostride),
                     }
+                }
+            };
+        }
+        macro_rules! go {
+            ($f:ident) => {
+                match isa {
+                    Isa::Vnni => run!(vnni, $f),
+                    Isa::Vnni512 => run!(vnni512, $f),
+                    _ => run!(avx2, $f),
                 }
             };
         }
@@ -476,127 +439,6 @@ pub fn dot_rows_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn hsum(v: __m256) -> f32 {
-    let a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-    let a = _mm_add_ps(a, _mm_movehl_ps(a, a));
-    _mm_cvtss_f32(_mm_add_ss(a, _mm_movehdup_ps(a)))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn f16_ld(p: *const u8) -> f32 {
-    let bits = unsafe { std::ptr::read_unaligned(p as *const u16) };
-    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits as i32)))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn ld(p: *const i8) -> __m256i {
-    unsafe { _mm256_loadu_si256(p as *const __m256i) }
-}
-
-/// Q2_0: two blocks per step; qs of both in one ymm (lane = block), plane k = (v >> 2k) & 3.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn rows_q2_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
-    let rb = cols / 64 * 18;
-    let m3 = _mm256_set1_epi8(3);
-    for r in 0..nr {
-        let row = unsafe { w.as_ptr().add(r * rb) };
-        let mut acc = [_mm256_setzero_ps(); T];
-        for p in 0..cols / 128 {
-            unsafe {
-                let b = row.add(36 * p);
-                let v = _mm256_set_m128i(
-                    _mm_loadu_si128(b.add(20) as *const __m128i),
-                    _mm_loadu_si128(b.add(2) as *const __m128i),
-                );
-                let c = [
-                    _mm256_and_si256(v, m3),
-                    _mm256_and_si256(_mm256_srli_epi16(v, 2), m3),
-                    _mm256_and_si256(_mm256_srli_epi16(v, 4), m3),
-                    _mm256_and_si256(_mm256_srli_epi16(v, 6), m3),
-                ];
-                let (d0, d1) = (
-                    std::ptr::read_unaligned(b as *const i16),
-                    std::ptr::read_unaligned(b.add(18) as *const i16),
-                );
-                let dw = _mm256_cvtph_ps(_mm_set_epi16(d1, d1, d1, d1, d0, d0, d0, d0));
-                for j in 0..T {
-                    let t = &tp[j];
-                    let x = t.x.add(128 * p);
-                    let mut s = _mm256_loadu_si256(t.o.add(8 * p) as *const __m256i);
-                    s = _mm256_dpbusd_avx_epi32(s, c[0], ld(x));
-                    s = _mm256_dpbusd_avx_epi32(s, c[1], ld(x.add(32)));
-                    s = _mm256_dpbusd_avx_epi32(s, c[2], ld(x.add(64)));
-                    s = _mm256_dpbusd_avx_epi32(s, c[3], ld(x.add(96)));
-                    let sc = _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(p / 2)));
-                    acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sc, acc[j]);
-                }
-            }
-        }
-        for j in 0..T {
-            unsafe { *out.add(j * os + r) = hsum(acc[j]) };
-        }
-    }
-}
-
-/// PTQ1_0: one block per step, 32-byte load (26 used); trit planes by u <- 3u (mod 256) on u = q ^ 0x80,
-/// trit = (u > -43) + (u > 42): the decoder's ((q * 3^n) & 255) * 3 >> 8 without byte multiplies.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn rows_ptq1_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
-    let rb = cols / 128 * 28;
-    let (k80, lo, hi) = (_mm256_set1_epi8(-128), _mm256_set1_epi8(-43), _mm256_set1_epi8(42));
-    let zero = _mm256_setzero_si256();
-    let mut tail = [0u8; 32];
-    for r in 0..nr {
-        let mut acc = [_mm256_setzero_ps(); T];
-        for b in 0..cols / 128 {
-            let off = r * rb + 28 * b;
-            unsafe {
-                let p = if off + 32 <= w.len() {
-                    w.as_ptr().add(off)
-                } else {
-                    tail[..28].copy_from_slice(&w[off..off + 28]);
-                    tail.as_ptr()
-                };
-                let mut u = _mm256_xor_si256(_mm256_loadu_si256(p as *const __m256i), k80);
-                let mut c = [zero; 5];
-                for cn in c.iter_mut() {
-                    let (m1, m2) = (_mm256_cmpgt_epi8(u, lo), _mm256_cmpgt_epi8(u, hi));
-                    *cn = _mm256_sub_epi8(_mm256_sub_epi8(zero, m1), m2);
-                    u = _mm256_add_epi8(u, _mm256_add_epi8(u, u));
-                    // keep LLVM from folding the chain into byte multiplies by 3^n (pmullw/pmaddubsw emulation)
-                    std::arch::asm!("/* {0} */", inout(ymm_reg) u, options(pure, nomem, nostack, preserves_flags));
-                }
-                let dw = _mm256_set1_ps(f16_ld(p.add(26)));
-                for j in 0..T {
-                    let t = &tp[j];
-                    let x = t.x.add(160 * b);
-                    let mut s = _mm256_loadu_si256(t.o.add(8 * b) as *const __m256i);
-                    for n in 0..5 {
-                        s = _mm256_dpbusd_avx_epi32(s, c[n], ld(x.add(32 * n)));
-                    }
-                    acc[j] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(s),
-                        _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(b / 2))),
-                        acc[j],
-                    );
-                }
-            }
-        }
-        for j in 0..T {
-            unsafe { *out.add(j * os + r) = hsum(acc[j]) };
-        }
-    }
-}
-
 #[inline(always)]
 fn q3k_scales(raw: &[u8]) -> [i8; 16] {
     let a = |i: usize| u32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap());
@@ -615,116 +457,344 @@ fn q3k_scales(raw: &[u8]) -> [i8; 16] {
     o
 }
 
-/// Q3_K: chunk (h, j) of 32 weights = 128h + 32j + l, natural order; code u = low2 | hbit << 2 in 0..7 (q = u - 4).
-/// maddubs + madd by the two 16-weight sub-scales, then -4 * sum(scale * s16) per block.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn rows_q3_k<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
-    let rb = cols / 256 * 110;
-    let (m3, m4) = (_mm256_set1_epi8(3), _mm256_set1_epi8(4));
-    // lane 0 <- i16 element 2j, lane 1 <- 2j + 1
-    let shuf: [__m256i; 4] = std::array::from_fn(|j| {
-        let c: [i8; 32] = std::array::from_fn(|i| (4 * j + 2 * (i / 16) + i % 2) as i8);
-        unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) }
-    });
-    for r in 0..nr {
-        let mut acc = [_mm256_setzero_ps(); T];
-        for blk in 0..cols / 256 {
-            unsafe {
-                let p = w.as_ptr().add(r * rb + 110 * blk);
-                let hm = _mm256_loadu_si256(p as *const __m256i);
-                let qs = [
-                    _mm256_loadu_si256(p.add(32) as *const __m256i),
-                    _mm256_loadu_si256(p.add(64) as *const __m256i),
-                ];
-                let sc8 = q3k_scales(std::slice::from_raw_parts(p.add(96), 12));
-                let sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(sc8.as_ptr() as *const __m128i));
-                let half = [
-                    _mm256_permute2x128_si256(sc16, sc16, 0x00),
-                    _mm256_permute2x128_si256(sc16, sc16, 0x11),
-                ];
-                let mut u = [_mm256_setzero_si256(); 8];
-                let mut sc = [_mm256_setzero_si256(); 8];
-                for h in 0..2 {
-                    for j in 0..4 {
-                        let low = match j {
-                            0 => qs[h],
-                            1 => _mm256_srli_epi16(qs[h], 2),
-                            2 => _mm256_srli_epi16(qs[h], 4),
-                            _ => _mm256_srli_epi16(qs[h], 6),
-                        };
-                        // hmask bit 4h + j -> bit 2
-                        let hb = match 4 * h + j {
-                            0 => _mm256_slli_epi16(hm, 2),
-                            1 => _mm256_slli_epi16(hm, 1),
-                            2 => hm,
-                            3 => _mm256_srli_epi16(hm, 1),
-                            4 => _mm256_srli_epi16(hm, 2),
-                            5 => _mm256_srli_epi16(hm, 3),
-                            6 => _mm256_srli_epi16(hm, 4),
-                            _ => _mm256_srli_epi16(hm, 5),
-                        };
-                        u[4 * h + j] = _mm256_or_si256(_mm256_and_si256(low, m3), _mm256_and_si256(hb, m4));
-                        sc[4 * h + j] = _mm256_shuffle_epi8(half[h], shuf[j]);
+/// The SIMD kernels, compiled once per instruction set (`isa`). They differ only in `dp`, the u8 x i8 -> i32
+/// dot product of four byte pairs added to s: AVX-VNNI's and AVX-512 VNNI's vpdpbusd, or AVX2's
+/// vpmaddubsw + vpmaddwd. The AVX2 form is exact here because no byte pair sums past i16: the largest is
+/// Q8_0's 2 * 128 * 127 = 32512.
+macro_rules! isa_kernels {
+    ($m:ident, $feat:literal, |$s:ident, $a:ident, $b:ident| $dp:expr) => {
+        #[cfg(target_arch = "x86_64")]
+        mod $m {
+            use super::*;
+
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn dp($s: __m256i, $a: __m256i, $b: __m256i) -> __m256i {
+                $dp
+            }
+
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn quantize_block(r: &QActRaw, tok: usize, blk: usize, x: &[f32; QK]) {
+                let xp = x.as_ptr();
+                let mut m = _mm256_setzero_ps();
+                let sign = _mm256_set1_ps(-0.0);
+                for i in 0..QK / 8 {
+                    m = _mm256_max_ps(m, _mm256_andnot_ps(sign, unsafe { _mm256_loadu_ps(xp.add(8 * i)) }));
+                }
+                let m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+                let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+                let amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_movehdup_ps(m2)));
+                let d = amax / 127.0;
+                let id = _mm256_set1_ps(if d > 0.0 { 1.0 / d } else { 0.0 });
+                let e0 = tok * r.n + blk * QK;
+                let ones = _mm256_set1_epi8(1);
+                unsafe {
+                    *r.d.add(e0 / QK) = d;
+                    let q = r.q.add(e0);
+                    let fix = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+                    for g in 0..QK / 32 {
+                        // cvtps rounds to nearest even (MXCSR default), like round_ties_even
+                        let c = |k: usize| _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xp.add(32 * g + 8 * k)), id));
+                        let ab = _mm256_packs_epi32(c(0), c(1));
+                        let cd = _mm256_packs_epi32(c(2), c(3));
+                        let v = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(ab, cd), fix);
+                        _mm256_storeu_si256(q.add(32 * g) as *mut __m256i, v);
+                        // per-16 sums: sad of q + 128 over 8 bytes
+                        let sad = _mm256_sad_epu8(_mm256_xor_si256(v, _mm256_set1_epi8(-128)), _mm256_setzero_si256());
+                        let mut e = [0u64; 4];
+                        _mm256_storeu_si256(e.as_mut_ptr() as *mut __m256i, sad);
+                        *r.s16.add(e0 / 16 + 2 * g) = (e[0] + e[1]) as i16 - 2048;
+                        *r.s16.add(e0 / 16 + 2 * g + 1) = (e[2] + e[3]) as i16 - 2048;
+                    }
+                    if r.layouts & L_Q2 != 0 {
+                        // per 128: 4x4 byte transpose in each 16-byte group, then a 4x4 dword transpose
+                        let t4 = _mm256_setr_epi8(
+                            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7,
+                            11, 15,
+                        );
+                        for h in 0..2 {
+                            let src = q.add(128 * h);
+                            let v: [__m256i; 4] = std::array::from_fn(|g| {
+                                let lo = _mm_loadu_si128(src.add(16 * g) as *const __m128i);
+                                let hi = _mm_loadu_si128(src.add(64 + 16 * g) as *const __m128i);
+                                _mm256_shuffle_epi8(_mm256_set_m128i(hi, lo), t4)
+                            });
+                            let t0 = _mm256_unpacklo_epi32(v[0], v[1]);
+                            let t1 = _mm256_unpacklo_epi32(v[2], v[3]);
+                            let t2 = _mm256_unpackhi_epi32(v[0], v[1]);
+                            let t3 = _mm256_unpackhi_epi32(v[2], v[3]);
+                            let p = [
+                                _mm256_unpacklo_epi64(t0, t1),
+                                _mm256_unpackhi_epi64(t0, t1),
+                                _mm256_unpacklo_epi64(t2, t3),
+                                _mm256_unpackhi_epi64(t2, t3),
+                            ];
+                            let dst = r.q2.add(e0 + 128 * h);
+                            let mut s = _mm256_setzero_si256();
+                            for k in 0..4 {
+                                _mm256_storeu_si256(dst.add(32 * k) as *mut __m256i, p[k]);
+                                s = dp(s, ones, p[k]);
+                            }
+                            let neg = _mm256_sub_epi32(_mm256_setzero_si256(), s);
+                            _mm256_storeu_si256(r.q2n.add((e0 + 128 * h) / 16) as *mut __m256i, neg);
+                        }
+                    }
+                    if r.layouts & L_T1 != 0 {
+                        for h in 0..2 {
+                            let src = q.add(128 * h);
+                            let b128 = (e0 + 128 * h) / 128;
+                            let dst = r.t1.add(b128 * 160);
+                            let mut s = _mm256_setzero_si256();
+                            for n in 0..5 {
+                                let lo = _mm_loadu_si128(src.add(16 * n) as *const __m128i);
+                                let mut hi = _mm_loadl_epi64(src.add(80 + 8 * n) as *const __m128i);
+                                if n < 4 {
+                                    let w = std::ptr::read_unaligned(src.add(120 + 2 * n) as *const i16);
+                                    hi = _mm_insert_epi16(hi, w as i32, 4);
+                                }
+                                let p = _mm256_set_m128i(hi, lo);
+                                _mm256_storeu_si256(dst.add(32 * n) as *mut __m256i, p);
+                                s = dp(s, ones, p);
+                            }
+                            let neg = _mm256_sub_epi32(_mm256_setzero_si256(), s);
+                            _mm256_storeu_si256(r.t1n.add(b128 * 8) as *mut __m256i, neg);
+                        }
                     }
                 }
-                let dw = _mm256_set1_ps(f16_ld(p.add(108)));
-                for jt in 0..T {
-                    let t = &tp[jt];
-                    let x = t.x.add(256 * blk);
-                    let s16 = _mm256_loadu_si256(t.s.add(16 * blk) as *const __m256i);
-                    let mut s = _mm256_slli_epi32(_mm256_madd_epi16(sc16, s16), 2);
-                    s = _mm256_sub_epi32(_mm256_setzero_si256(), s);
-                    for c in 0..8 {
-                        s = _mm256_add_epi32(
-                            s,
-                            _mm256_madd_epi16(_mm256_maddubs_epi16(u[c], ld(x.add(32 * c))), sc[c]),
-                        );
+            }
+
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn hsum(v: __m256) -> f32 {
+                let a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+                let a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+                _mm_cvtss_f32(_mm_add_ss(a, _mm_movehdup_ps(a)))
+            }
+
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn f16_ld(p: *const u8) -> f32 {
+                let bits = unsafe { std::ptr::read_unaligned(p as *const u16) };
+                _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits as i32)))
+            }
+
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn ld(p: *const i8) -> __m256i {
+                unsafe { _mm256_loadu_si256(p as *const __m256i) }
+            }
+
+            /// Q2_0: two blocks per step; qs of both in one ymm (lane = block), plane k = (v >> 2k) & 3.
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_q2_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let rb = cols / 64 * 18;
+                let m3 = _mm256_set1_epi8(3);
+                for r in 0..nr {
+                    let row = unsafe { w.as_ptr().add(r * rb) };
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for p in 0..cols / 128 {
+                        unsafe {
+                            let b = row.add(36 * p);
+                            let v = _mm256_set_m128i(
+                                _mm_loadu_si128(b.add(20) as *const __m128i),
+                                _mm_loadu_si128(b.add(2) as *const __m128i),
+                            );
+                            let c = [
+                                _mm256_and_si256(v, m3),
+                                _mm256_and_si256(_mm256_srli_epi16(v, 2), m3),
+                                _mm256_and_si256(_mm256_srli_epi16(v, 4), m3),
+                                _mm256_and_si256(_mm256_srli_epi16(v, 6), m3),
+                            ];
+                            let (d0, d1) = (
+                                std::ptr::read_unaligned(b as *const i16),
+                                std::ptr::read_unaligned(b.add(18) as *const i16),
+                            );
+                            let dw = _mm256_cvtph_ps(_mm_set_epi16(d1, d1, d1, d1, d0, d0, d0, d0));
+                            for j in 0..T {
+                                let t = &tp[j];
+                                let x = t.x.add(128 * p);
+                                let mut s = _mm256_loadu_si256(t.o.add(8 * p) as *const __m256i);
+                                s = dp(s, c[0], ld(x));
+                                s = dp(s, c[1], ld(x.add(32)));
+                                s = dp(s, c[2], ld(x.add(64)));
+                                s = dp(s, c[3], ld(x.add(96)));
+                                let sc = _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(p / 2)));
+                                acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sc, acc[j]);
+                            }
+                        }
                     }
-                    acc[jt] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(s),
-                        _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(blk))),
-                        acc[jt],
-                    );
+                    for j in 0..T {
+                        unsafe { *out.add(j * os + r) = hsum(acc[j]) };
+                    }
+                }
+            }
+
+            /// PTQ1_0: one block per step, 32-byte load (26 used); trit planes by u <- 3u (mod 256) on u = q ^ 0x80,
+            /// trit = (u > -43) + (u > 42): the decoder's ((q * 3^n) & 255) * 3 >> 8 without byte multiplies.
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_ptq1_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let rb = cols / 128 * 28;
+                let (k80, lo, hi) = (_mm256_set1_epi8(-128), _mm256_set1_epi8(-43), _mm256_set1_epi8(42));
+                let zero = _mm256_setzero_si256();
+                let mut tail = [0u8; 32];
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for b in 0..cols / 128 {
+                        let off = r * rb + 28 * b;
+                        unsafe {
+                            let p = if off + 32 <= w.len() {
+                                w.as_ptr().add(off)
+                            } else {
+                                tail[..28].copy_from_slice(&w[off..off + 28]);
+                                tail.as_ptr()
+                            };
+                            let mut u = _mm256_xor_si256(_mm256_loadu_si256(p as *const __m256i), k80);
+                            let mut c = [zero; 5];
+                            for cn in c.iter_mut() {
+                                let (m1, m2) = (_mm256_cmpgt_epi8(u, lo), _mm256_cmpgt_epi8(u, hi));
+                                *cn = _mm256_sub_epi8(_mm256_sub_epi8(zero, m1), m2);
+                                u = _mm256_add_epi8(u, _mm256_add_epi8(u, u));
+                                // keep LLVM from folding the chain into byte multiplies by 3^n (pmullw/pmaddubsw emulation)
+                                std::arch::asm!("/* {0} */", inout(ymm_reg) u, options(pure, nomem, nostack, preserves_flags));
+                            }
+                            let dw = _mm256_set1_ps(f16_ld(p.add(26)));
+                            for j in 0..T {
+                                let t = &tp[j];
+                                let x = t.x.add(160 * b);
+                                let mut s = _mm256_loadu_si256(t.o.add(8 * b) as *const __m256i);
+                                for n in 0..5 {
+                                    s = dp(s, c[n], ld(x.add(32 * n)));
+                                }
+                                acc[j] = _mm256_fmadd_ps(
+                                    _mm256_cvtepi32_ps(s),
+                                    _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(b / 2))),
+                                    acc[j],
+                                );
+                            }
+                        }
+                    }
+                    for j in 0..T {
+                        unsafe { *out.add(j * os + r) = hsum(acc[j]) };
+                    }
+                }
+            }
+
+
+            /// Q3_K: chunk (h, j) of 32 weights = 128h + 32j + l, natural order; code u = low2 | hbit << 2 in 0..7 (q = u - 4).
+            /// maddubs + madd by the two 16-weight sub-scales, then -4 * sum(scale * s16) per block.
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_q3_k<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let rb = cols / 256 * 110;
+                let (m3, m4) = (_mm256_set1_epi8(3), _mm256_set1_epi8(4));
+                // lane 0 <- i16 element 2j, lane 1 <- 2j + 1
+                let shuf: [__m256i; 4] = std::array::from_fn(|j| {
+                    let c: [i8; 32] = std::array::from_fn(|i| (4 * j + 2 * (i / 16) + i % 2) as i8);
+                    unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) }
+                });
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for blk in 0..cols / 256 {
+                        unsafe {
+                            let p = w.as_ptr().add(r * rb + 110 * blk);
+                            let hm = _mm256_loadu_si256(p as *const __m256i);
+                            let qs = [
+                                _mm256_loadu_si256(p.add(32) as *const __m256i),
+                                _mm256_loadu_si256(p.add(64) as *const __m256i),
+                            ];
+                            let sc8 = q3k_scales(std::slice::from_raw_parts(p.add(96), 12));
+                            let sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(sc8.as_ptr() as *const __m128i));
+                            let half = [
+                                _mm256_permute2x128_si256(sc16, sc16, 0x00),
+                                _mm256_permute2x128_si256(sc16, sc16, 0x11),
+                            ];
+                            let mut u = [_mm256_setzero_si256(); 8];
+                            let mut sc = [_mm256_setzero_si256(); 8];
+                            for h in 0..2 {
+                                for j in 0..4 {
+                                    let low = match j {
+                                        0 => qs[h],
+                                        1 => _mm256_srli_epi16(qs[h], 2),
+                                        2 => _mm256_srli_epi16(qs[h], 4),
+                                        _ => _mm256_srli_epi16(qs[h], 6),
+                                    };
+                                    // hmask bit 4h + j -> bit 2
+                                    let hb = match 4 * h + j {
+                                        0 => _mm256_slli_epi16(hm, 2),
+                                        1 => _mm256_slli_epi16(hm, 1),
+                                        2 => hm,
+                                        3 => _mm256_srli_epi16(hm, 1),
+                                        4 => _mm256_srli_epi16(hm, 2),
+                                        5 => _mm256_srli_epi16(hm, 3),
+                                        6 => _mm256_srli_epi16(hm, 4),
+                                        _ => _mm256_srli_epi16(hm, 5),
+                                    };
+                                    u[4 * h + j] = _mm256_or_si256(_mm256_and_si256(low, m3), _mm256_and_si256(hb, m4));
+                                    sc[4 * h + j] = _mm256_shuffle_epi8(half[h], shuf[j]);
+                                }
+                            }
+                            let dw = _mm256_set1_ps(f16_ld(p.add(108)));
+                            for jt in 0..T {
+                                let t = &tp[jt];
+                                let x = t.x.add(256 * blk);
+                                let s16 = _mm256_loadu_si256(t.s.add(16 * blk) as *const __m256i);
+                                let mut s = _mm256_slli_epi32(_mm256_madd_epi16(sc16, s16), 2);
+                                s = _mm256_sub_epi32(_mm256_setzero_si256(), s);
+                                for c in 0..8 {
+                                    s = _mm256_add_epi32(
+                                        s,
+                                        _mm256_madd_epi16(_mm256_maddubs_epi16(u[c], ld(x.add(32 * c))), sc[c]),
+                                    );
+                                }
+                                acc[jt] = _mm256_fmadd_ps(
+                                    _mm256_cvtepi32_ps(s),
+                                    _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(blk))),
+                                    acc[jt],
+                                );
+                            }
+                        }
+                    }
+                    for j in 0..T {
+                        unsafe { *out.add(j * os + r) = hsum(acc[j]) };
+                    }
+                }
+            }
+
+            /// Q8_0: |w| x sign(x, w).
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_q8_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let rb = cols / 32 * 34;
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for b in 0..cols / 32 {
+                        unsafe {
+                            let p = w.as_ptr().add(r * rb + 34 * b);
+                            let q = _mm256_loadu_si256(p.add(2) as *const __m256i);
+                            let aq = _mm256_sign_epi8(q, q);
+                            let dw = _mm256_set1_ps(f16_ld(p));
+                            for j in 0..T {
+                                let t = &tp[j];
+                                let xs = _mm256_sign_epi8(ld(t.x.add(32 * b)), q);
+                                let s = dp(_mm256_setzero_si256(), aq, xs);
+                                acc[j] = _mm256_fmadd_ps(
+                                    _mm256_cvtepi32_ps(s),
+                                    _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(b / 8))),
+                                    acc[j],
+                                );
+                            }
+                        }
+                    }
+                    for j in 0..T {
+                        unsafe { *out.add(j * os + r) = hsum(acc[j]) };
+                    }
                 }
             }
         }
-        for j in 0..T {
-            unsafe { *out.add(j * os + r) = hsum(acc[j]) };
-        }
-    }
+    };
 }
 
-/// Q8_0: |w| x sign(x, w).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avxvnni,fma,f16c")]
-unsafe fn rows_q8_0<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
-    let rb = cols / 32 * 34;
-    for r in 0..nr {
-        let mut acc = [_mm256_setzero_ps(); T];
-        for b in 0..cols / 32 {
-            unsafe {
-                let p = w.as_ptr().add(r * rb + 34 * b);
-                let q = _mm256_loadu_si256(p.add(2) as *const __m256i);
-                let aq = _mm256_sign_epi8(q, q);
-                let dw = _mm256_set1_ps(f16_ld(p));
-                for j in 0..T {
-                    let t = &tp[j];
-                    let xs = _mm256_sign_epi8(ld(t.x.add(32 * b)), q);
-                    let s = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aq, xs);
-                    acc[j] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(s),
-                        _mm256_mul_ps(dw, _mm256_broadcast_ss(&*t.d.add(b / 8))),
-                        acc[j],
-                    );
-                }
-            }
-        }
-        for j in 0..T {
-            unsafe { *out.add(j * os + r) = hsum(acc[j]) };
-        }
-    }
-}
+isa_kernels!(vnni, "avx2,avxvnni,fma,f16c", |s, a, b| _mm256_dpbusd_avx_epi32(s, a, b));
+isa_kernels!(vnni512, "avx2,avx512vnni,avx512vl,fma,f16c", |s, a, b| _mm256_dpbusd_epi32(s, a, b));
+isa_kernels!(avx2, "avx2,fma,f16c", |s, a, b| _mm256_add_epi32(s, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), _mm256_set1_epi16(1))));
 
 #[cfg(test)]
 pub mod tests {
@@ -787,9 +857,21 @@ pub mod tests {
             .collect()
     }
 
+    /// the SIMD instruction sets this CPU runs
+    fn simd_isas() -> Vec<Isa> {
+        let v: Vec<Isa> = [Isa::Vnni, Isa::Vnni512, Isa::Avx2].into_iter().filter(|i| i.supported()).collect();
+        assert!(!v.is_empty(), "test box lacks AVX2");
+        v
+    }
+
     #[test]
     fn kernels_match_scalar() {
-        assert!(simd_ok(), "test box lacks AVX-VNNI");
+        for isa in simd_isas() {
+            kernels_match_scalar_on(isa);
+        }
+    }
+
+    fn kernels_match_scalar_on(isa: Isa) {
         let mut rng = Rng(0x9e3779b97f4a7c15);
         for ty in [GType::Q2_0, GType::Ptq1_0, GType::Q3K, GType::Q8_0] {
             for &cols in &[5120usize, 2304] {
@@ -800,7 +882,7 @@ pub mod tests {
                     let act = QAct::new(&x, t, cols, &[ty]);
                     let toks: Vec<usize> = (0..t).collect();
                     let (mut simd, mut sc) = (vec![0f32; t * nr], vec![0f32; t * nr]);
-                    dot_rows(ty, &rows, cols, &act, &mut simd);
+                    dot_rows_isa(isa, ty, &rows, cols, &act, &toks, &mut simd, nr);
                     dot_rows_scalar(ty, &rows, cols, &act, &toks, &mut sc, nr);
                     let e_sc = rel(&simd, &sc);
                     let reff: Vec<f32> = (0..t)
@@ -808,10 +890,10 @@ pub mod tests {
                         .collect();
                     let e_f32 = rel(&simd, &reff);
                     if t == 6 {
-                        println!("{ty:?} cols {cols} T {t}: vs int8 scalar {e_sc:.2e}, vs f32 {e_f32:.2e}");
+                        println!("{isa:?} {ty:?} cols {cols} T {t}: vs int8 scalar {e_sc:.2e}, vs f32 {e_f32:.2e}");
                     }
-                    assert!(e_sc < 1e-6, "{ty:?} cols {cols} T {t}: {e_sc}");
-                    assert!(e_f32 < 2e-2, "{ty:?} cols {cols} T {t}: {e_f32}");
+                    assert!(e_sc < 1e-6, "{isa:?} {ty:?} cols {cols} T {t}: {e_sc}");
+                    assert!(e_f32 < 2e-2, "{isa:?} {ty:?} cols {cols} T {t}: {e_f32}");
                 }
             }
         }
@@ -825,9 +907,29 @@ pub mod tests {
         let mut x: Vec<f32> = (0..t * n).map(|_| rng.normal() * 3.0).collect();
         x[300..556].fill(0.0); // an all-zero block
         x[5] = 1e4; // an outlier
-        let a = QAct::new(&x, t, n, &tys);
+        for isa in simd_isas() {
+            let mut a = QAct::default();
+            a.reset(t, n, &tys);
+            let r = a.raw();
+            for tok in 0..t {
+                for blk in 0..n / QK {
+                    let xb: &[f32; QK] = x[tok * n + blk * QK..][..QK].try_into().unwrap();
+                    unsafe {
+                        match isa {
+                            Isa::Vnni => vnni::quantize_block(&r, tok, blk, xb),
+                            Isa::Vnni512 => vnni512::quantize_block(&r, tok, blk, xb),
+                            _ => avx2::quantize_block(&r, tok, blk, xb),
+                        }
+                    }
+                }
+            }
+            quantize_matches_scalar(&a, &x, t, n, &tys);
+        }
+    }
+
+    fn quantize_matches_scalar(a: &QAct, x: &[f32], t: usize, n: usize, tys: &[GType]) {
         let mut b = QAct::default();
-        b.reset(t, n, &tys);
+        b.reset(t, n, tys);
         let r = b.raw();
         for tok in 0..t {
             for blk in 0..n / QK {

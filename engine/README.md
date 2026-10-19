@@ -33,7 +33,7 @@ Debug: `DSX_DUMP=dir` (per-layer residual streams, ref vs GPU), `DSX_ROUTES=1` (
 | `formats.rs`, `numerics.rs` | block decoders (Q8_0, Q2_0, PTQ1_0, Q3_K, Q6_K, FP8 32x32, FP4), FP8/FP4 fake quant, RoPE + YaRN |
 | `model.rs` | config, weight handles (`Mat`), the CPU reference forward |
 | `dspark.rs` | DSpark draft stack (reference) |
-| `cpu/` | AVX2 + AVX-VNNI expert kernels, pinned thread pool, per-layer CPU MoE |
+| `cpu/` | AVX2 expert kernels (with AVX-VNNI or AVX-512 VNNI where the CPU has it), pinned thread pool, per-layer CPU MoE |
 | `gpu.rs` | CUDA boundary: contexts, buffers, hugepage host memory, launches, cuBLAS, stream flag ops |
 | `kernels/` | `dsx.cu` (dense path, attention, compressor, indexer, router, prefill helpers), `moe.cuh`, `expert_fast.cuh` (repacked VRAM experts, int8 mma, T tokens), `topk.cuh` |
 | `gpumodel.rs` | GPU decode: dense half on GPU0, experts on GPU0 / GPU1 / CPU, sync-free per-layer handoff |
