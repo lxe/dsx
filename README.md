@@ -98,10 +98,18 @@ For the [pi](https://github.com/badlogic/pi-mono) coding agent, add this to `~/.
         {
           "id": "deepseek-v4.1-flash",
           "reasoning": true,
-          "input": ["text"],
+          "input": ["text", "image"],
           "contextWindow": 131072,
           "maxTokens": 8192,
-          "thinkingLevelMap": { "off": "none", "high": "high" }
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
         }
       ]
     }
