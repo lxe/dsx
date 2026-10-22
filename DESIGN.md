@@ -11,8 +11,9 @@ drive. The performance model behind these choices is in [FINDINGS.md](FINDINGS.m
 3. **VRAM holds the hottest experts**, ranked by measured routing frequency; the main GPU's share adapts to the
    conversation.
 4. **Roles follow the links.** At startup each GPU's host bandwidth is measured: the best-linked GPU (GPU0 here) is
-   the main one; other GPUs are expert stores, adaptive when their link is at least half as fast, otherwise fixed and
-   carrying only activations (GPU1's PCIe 3.0 x4).
+   the main one; other GPUs are expert stores. A store whose link is at least half as fast swaps experts like the main
+   GPU's cache and takes a share of prefill's expert stream; a slower one (GPU1 on a PCIe 3.0 x4 slot) keeps a fixed
+   set and carries only activations.
 5. **Quant formats fit the kernels:** CPU unpacking keeps up with RAM bandwidth (AVX2 / AVX-VNNI), GPU experts run on
    int8 `mma.sync`.
 6. **Exact routing.** A routing bias exists for experiments, off by default.
@@ -23,8 +24,12 @@ drive. The performance model behind these choices is in [FINDINGS.md](FINDINGS.m
 |---|---|
 | GPU0 (24 GB, x16) | dense weights (Q8_0, ~8 GB), KV cache and indexer keys, adaptive expert cache (~11 GB), prefill buffers |
 | GPU1 (24 GB, x4) | fixed set of hot experts (~23 GB) |
-| RAM (~110 GB) | hugepage-backed, CUDA-registered arena: every expert not on GPU1, laid out per (layer, expert) |
+| GPU1 (24 GB, x16) | adaptive expert cache (~23 GB), prefill buffers and four staging buffers for its share of the stream |
+| RAM (~110 GB; ~135 GB with an x16 GPU1) | hugepage-backed, CUDA-registered arena: every expert the CPU computes, plus copies of the adaptive caches' experts, laid out per (layer, expert) |
 | NVMe | the GGUF (loaded once; the coldest experts are read from it on demand) and the Engram tables |
+
+With GPU1 on x16 the arena also holds copies of GPU1's experts (an adaptive cache evicts back to RAM), so at
+`--arena-gb 110` ~3,500 cold experts stay in the file; 150+ GB of RAM fits `--arena-gb 135`.
 
 ## Decode
 
@@ -46,9 +51,12 @@ arena and repacked on a side stream.
 ## Prefill
 
 - Layers 0-20 run on every prompt token; layers 21-39 run only on the tokens later positions can still attend to.
-- Prompts are processed in chunks (4096 tokens by default). Each chunk streams the arena's experts to GPU0 through
-  four staging buffers while the previous expert computes; each aux GPU computes its own experts on the shipped
-  activations.
+- Prompts are processed in chunks (4096 tokens by default). Each chunk streams the arena's experts through four
+  staging buffers per GPU while the previous expert computes; each aux GPU computes its own experts on the shipped
+  activations. An aux GPU with a fast link (at least half the main GPU's) also takes a share of the streamed experts:
+  each goes to the GPU whose queued copies finish first, with the main GPU's link counted twice (the aux GPU also
+  computes its larger resident set). The host enqueues the GPUs' expert work round-robin, since a CUDA stream accepts
+  only ~1K queued operations before the host blocks.
 - Attention uses a tensor-core kernel for long chunks, and Engram rows are deduplicated per chunk.
 
 ## Server

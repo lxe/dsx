@@ -19,9 +19,11 @@ startup it measures each GPU's memory and host-to-device bandwidth. The best-lin
 memory) becomes the main GPU: dense weights, KV cache, prefill buffers and its own expert cache.
 Every other GPU only holds experts.
 
-An expert GPU whose link is at least half as fast as the main GPU's swaps experts like the main GPU's cache. A slower
-one (a PCIe x4 slot) holds a fixed set: copying experts over it competes with the activations it needs every layer
-(forcing swaps on the x4 card measured 22-31 tok/s against 29).
+An expert GPU whose link is at least half as fast as the main GPU's swaps experts like the main GPU's cache and
+takes a share of the expert stream during prefill. Swapping needs RAM copies of its experts: when the arena would leave
+more than 5% of the expert bytes in the file because of them, the GPU keeps a fixed set and only streams. A slower one (a PCIe x4 slot) holds a fixed set and only runs its
+own experts: copying experts over it competes with the activations it needs every layer (forcing swaps on the x4 card
+measured 22-31 tok/s against 29).
 
 ## Which experts go where
 
@@ -38,8 +40,12 @@ Experts an adaptive GPU may evict keep a copy in the arena, so the arena is size
 
 ## Prefill
 
-Each chunk streams the main GPU's missing experts from the arena over PCIe while the previous expert computes; the
-other GPUs run their own experts on the chunk's activations in parallel.
+Each chunk streams the experts no GPU holds from the arena over PCIe while the previous expert computes; the other
+GPUs run their own experts on the chunk's activations in parallel. A fast-linked expert GPU also takes part of the
+stream into its own staging buffers, so both links carry the arena: each streamed expert goes to the GPU whose queued
+copies finish first, counting the main GPU's link twice (`DSX_STREAM_MAIN_W`), because the other GPU also computes its
+larger resident set. Link speeds count in quarters of the main GPU's, so the split, and the output, does not change
+with run-to-run noise in the startup measurement.
 
 ## Flags
 
@@ -53,6 +59,8 @@ other GPUs run their own experts on the chunk's activations in parallel.
 | `DSX_GPUS=0,2` | use only these GPUs |
 | `DSX_ADAPT=N` | swaps per token per adaptive GPU (default 8; 0 = static placement) |
 | `DSX_AUX_ADAPTIVE=1` / `0` | force the other GPUs adaptive / fixed regardless of their link |
+| `DSX_AUX_STREAM=1` / `0` | force the other GPUs to take / not take a share of prefill's expert stream regardless of their link |
+| `DSX_STREAM_MAIN_W=x` | weight of the main GPU's link when the stream is split (default 2) |
 
 `--gpu0-gb` and `--gpu1-gb` still work as aliases of `--main-gb` and `--aux-gb`.
 
@@ -76,6 +84,8 @@ experts: its weights (~1 GB) stay in RAM and stream to the main GPU one block at
 | Machine | Flags |
 |---|---|
 | 2x 24 GB GPU, 128 GB RAM | `--arena-gb 110` |
+| 2x 24 GB GPU, both x16, 150+ GB RAM | `--arena-gb 135`: the second GPU swaps too, and its experts need RAM copies |
+| 2x 24 GB GPU, both x16, 128 GB RAM | `--arena-gb 110`: the arena has no room for the second GPU's copies, so it keeps a fixed set (it still streams prefill experts) |
 | 1x 32 GB GPU, 128 GB RAM | `--main-gb=-2.0 --arena-gb 80`, `DSX_ADAPT=0`: the cache's RAM copies cost space this machine does not have |
 
 Measurements behind these choices (cache hit rates, swap and decay sweeps, CPU bandwidth): [FINDINGS.md](../FINDINGS.md),

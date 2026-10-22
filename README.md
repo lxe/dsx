@@ -187,6 +187,7 @@ Settings by machine (the flags are explained in [docs/placement.md](docs/placeme
 | Machine | Flags |
 |---|---|
 | 2x 24 GB GPU, 128 GB RAM | `--arena-gb 110` |
+| 2x 24 GB GPU, both PCIe x16, 150+ GB RAM | `--arena-gb 135` |
 | 1x 32 GB GPU, 128 GB RAM | `--main-gb=-2.0 --arena-gb 80`, `DSX_ADAPT=0` |
 
 ## Thinking
@@ -235,9 +236,10 @@ to run.
   history end up with different experts on the card.
 - **It measures your GPUs:** at startup, dsx times how fast each GPU talks to the CPU and checks its memory. The
   best-connected card becomes the main GPU and holds the dense weights (attention and the shared parts), the conversation's memory (the KV cache)
-  and its own expert cache. Every other card only holds experts. A card in a slow slot (a PCIe x4 slot, say) keeps a
-  fixed set of experts instead of swapping them, because copying experts would compete with the work it needs every
-  layer. Mismatched cards are fine: up to six GPUs, each used for what it's good at.
+  and its own expert cache. Every other card only holds experts. A card with a link about as fast swaps its experts
+  too and helps stream experts during long prompts. A card in a slow slot (a PCIe x4 slot, say) keeps a fixed set of
+  experts instead, because copying experts would compete with the work it needs every layer. Mismatched cards are
+  fine: up to six GPUs, each used for what it's good at.
 - **GPUs and CPU work at the same time:** in every layer, the main GPU picks the experts and hands their input to the
   CPU and the other GPUs through shared memory. Each computes its own experts in parallel, and the main GPU adds the
   results. The handoff takes about 6 µs and never waits on the operating system.
@@ -245,8 +247,8 @@ to run.
   cores, from memory locked in large pages so the CPU reads it at full speed.
 - **Optional deferral:** `--defer-rank 3` lets the CPU's least important experts finish one layer late instead of
   holding up the GPU: 15-20% faster decode for a small change in the output.
-- **Long prompts:** prompts are read in chunks of 4,096 tokens. The main GPU streams the experts it lacks from RAM
-  while it computes, and the other GPUs work on the same chunk in parallel.
+- **Long prompts:** prompts are read in chunks of 4,096 tokens. The experts no GPU holds stream from RAM while the
+  GPUs compute, over every fast link at once, and the other GPUs work on the same chunk in parallel.
 - **Picks up where you left off:** the last conversation stays on the GPU, so the next message only reads the new
   text.
 

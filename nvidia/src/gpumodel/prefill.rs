@@ -4,8 +4,9 @@
 //! skipping the decoder for older prompt tokens gives the same caches as decoding token by token.
 //!
 //! Dense weights are dequantized to f16 per layer and multiplied with cuBLAS (f32 accumulation). Routed experts
-//! run as one grouped GEMM per expert over the tokens routed to it; experts not resident on GPU0 are copied in
-//! from the RAM arena (hugepage, full PCIe speed) or the mmapped file.
+//! run as one grouped GEMM per expert over the tokens routed to it; experts resident on no GPU are copied in from
+//! the RAM arena (hugepage, full PCIe speed) or the mmapped file, split between the main GPU and the aux GPUs whose
+//! links are as fast (`AuxPrefill::stream`) in proportion to their link bandwidth.
 
 use super::*;
 use crate::gguf::GType;
@@ -25,6 +26,16 @@ pub(crate) fn dq_grid(ty: i32, rows: usize, cols: usize) -> (u32, u32, u32) {
 
 /// staging buffers for streamed experts (copies run ahead of compute by up to NSTAGE - 1 experts)
 const NSTAGE: usize = 4;
+
+/// one staging buffer: any expert's raw gate + up + down (at most 8.5 bits per weight)
+fn stage_bytes(c: &crate::model::Config) -> usize {
+    3 * c.inter * c.dim / 32 * 34 + 4096
+}
+
+/// VRAM an aux GPU's prefill buffers take (placement leaves this free); `stream` adds the expert staging buffers
+pub(crate) fn aux_prefill_bytes(c: &crate::model::Config, tmax: usize, stream: bool) -> usize {
+    tmax * (c.dim * 16 + c.inter * 10 + 64) + c.inter * c.dim * 2 + (256 << 20) + if stream { NSTAGE * stage_bytes(c) } else { 0 }
+}
 
 pub struct PrefillBufs {
     pub tmax: usize,
@@ -77,7 +88,9 @@ pub struct PrefillBufs {
 }
 
 /// An aux GPU's share of prefill: its resident experts run there on activations shipped over its link
-/// (moving ~42 MB of activations per layer beats moving its ~0.6 GB of weights per layer over an x4 link).
+/// (moving ~42 MB of activations per layer beats moving its ~0.6 GB of weights per layer over an x4 link). An aux GPU
+/// with a link as fast as the main GPU's also takes a share of the streamed experts (its own staging buffers, copies
+/// on its side stream), so both links carry the arena.
 pub struct AuxPrefill {
     x16: Buf,
     rows: Buf,
@@ -90,11 +103,20 @@ pub struct AuxPrefill {
     w16: Buf,
     out: Buf,
     out_host: crate::gpu::HostBuf,
+    /// pinned copies of the layer's token rows and weights (uploaded without a host sync)
+    idx_host: crate::gpu::HostBuf,
+    /// streamed-expert staging and its events (empty when this GPU takes no share of the stream)
+    estage: Vec<Buf>,
+    ev_ready: Vec<crate::gpu::Event>,
+    ev_free: Vec<crate::gpu::Event>,
+    /// host -> device GB/s of this GPU's link: its share of the streamed experts
+    pub link_gbs: f64,
     k: std::collections::HashMap<&'static str, crate::gpu::Kernel>,
 }
 
 impl AuxPrefill {
-    pub fn new(g1: &Gpu, m: &Model, tmax: usize) -> Result<AuxPrefill> {
+    /// `stream`: take a share of the streamed experts (link_gbs > 0 weighs it against the main GPU's link)
+    pub fn new(g1: &Gpu, m: &Model, tmax: usize, stream: bool, link_gbs: f64) -> Result<AuxPrefill> {
         let c = &m.cfg;
         let (d, inter) = (c.dim, c.inter);
         let mut k = std::collections::HashMap::new();
@@ -113,8 +135,46 @@ impl AuxPrefill {
             w16: g1.alloc(inter * d * 2)?,
             out: g1.alloc(tmax * d * 4)?,
             out_host: crate::gpu::HostBuf::new(tmax * d * 4)?,
+            idx_host: crate::gpu::HostBuf::new(tmax * 8 * 4 * 2)?,
+            estage: if stream { (0..NSTAGE).map(|_| g1.alloc(stage_bytes(c))).collect::<Result<_>>()? } else { vec![] },
+            ev_ready: if stream { (0..NSTAGE).map(|_| g1.event()).collect::<Result<_>>()? } else { vec![] },
+            ev_free: if stream { (0..NSTAGE).map(|_| g1.event()).collect::<Result<_>>()? } else { vec![] },
+            link_gbs,
             k,
         })
+    }
+}
+
+/// One GPU's routed-expert work for a prefill layer: its buffers, store and staging (queue_expert enqueues one expert)
+struct ExpQueue<'a> {
+    g: &'a Gpu,
+    k: &'a std::collections::HashMap<&'static str, crate::gpu::Kernel>,
+    /// gathers the expert's token rows of x into gx16 (f32 x on the main GPU, f16 x16 on an aux GPU)
+    gather: &'static str,
+    x: u64,
+    rows: u64,
+    wrow: u64,
+    gx16: u64,
+    gg: u64,
+    gu: u64,
+    h16: u64,
+    go: u64,
+    w16: u64,
+    out: u64,
+    store: Option<&'a crate::experts::GpuExperts>,
+    estage: &'a [Buf],
+    ev_ready: &'a [crate::gpu::Event],
+    ev_free: &'a [crate::gpu::Event],
+    nstaged: usize,
+}
+
+impl ExpQueue<'_> {
+    /// the side stream must not overwrite a staging buffer before the main stream reaches this layer's experts
+    fn start(&self) -> Result<()> {
+        for e in self.ev_free {
+            self.g.record(*e, false)?;
+        }
+        Ok(())
     }
 }
 
@@ -129,6 +189,15 @@ fn noise_rel(li: usize) -> Option<f32> {
         Some((a.parse().ok()?, b.parse().ok()?, rel.parse().ok()?))
     });
     n.and_then(|(a, b, rel)| (li >= a && li <= b).then_some(rel))
+}
+
+/// DSX_STREAM_MAIN_W=x: the main GPU's link counts x times its own speed when streamed experts are split between it
+/// and the streaming aux GPUs. Default 2: an aux GPU also computes its resident experts (twice the main GPU's on 2x
+/// RTX 3090), and on PCIe 3.0 x16 links an expert's compute costs about as much as its copy; best of 1-3 on an 8K
+/// prompt (warm prefill 15.6 s streaming on the main GPU alone, 14.4-15.4 s at 1, 12.9-13.3 s at 2, 13.5 s at 3)
+fn stream_main_weight() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DSX_STREAM_MAIN_W").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0))
 }
 
 pub(crate) const SUB: usize = 256; // indexer queries per pass (bounds the [queries][positions] score matrix)
@@ -177,7 +246,7 @@ impl PrefillBufs {
             go: f(tmax * c.dim)?,
             rows: g.alloc(tmax * 8 * 4)?,
             wrow: f(tmax * 8)?,
-            estage: (0..NSTAGE).map(|_| g.alloc(3 * c.inter * c.dim / 32 * 34 + 4096)).collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("estage"))?,
+            estage: (0..NSTAGE).map(|_| g.alloc(stage_bytes(c))).collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("estage"))?,
             ev_ready: (0..NSTAGE).map(|_| g.event()).collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("ev_ready"))?,
             ev_free: (0..NSTAGE).map(|_| g.event()).collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("ev_free"))?,
             ev_x: g.event()?,
@@ -199,57 +268,117 @@ fn type_id(t: GType) -> i32 {
 }
 
 impl GpuModel<'_> {
-    /// Enqueue the aux GPUs' experts for this layer (`spans[i]`: aux i's share; returns without waiting,
-    /// prefill_moe syncs each before adding).
-    #[allow(clippy::too_many_arguments)]
-    fn prefill_moe_aux(&self, pb: &PrefillBufs, li: usize, x: u64, n: usize, spans: &[Vec<(usize, usize, usize)>], all_rows: &[i32], all_w: &[f32]) -> Result<()> {
-        let rot = self.m.cfg.expert_rot[li];
-        let c = &self.m.cfg;
-        let (d, inter) = (c.dim, c.inter);
-        // x -> f16 on GPU0 -> pinned host -> each aux GPU; the host waits for this copy only (an event), not for the
-        // rest of GPU0's queue: a full sync here stalled every layer behind the shared expert while no weights were copying
+    /// Ship this layer's expert input toward the aux GPUs: f16 on the main GPU, copied into pinned host memory. Only
+    /// queued here; prefill_moe_aux waits for the copy's event once the main GPU's shared expert is queued behind it.
+    fn prefill_ship_x(&self, pb: &PrefillBufs, x: u64, n: usize) -> Result<()> {
+        let d = self.m.cfg.dim;
         self.g.launch(self.k["to_f16"], (((n * d) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(x), Arg::P(pb.act16.ptr), Arg::I((n * d) as i32)])?;
         let xh = unsafe { std::slice::from_raw_parts_mut(pb.x_host.host_ptr() as *mut u16, n * d) };
         self.g.dtoh(xh, pb.act16.ptr)?;
-        self.g.record(pb.ev_x, false)?;
+        self.g.record(pb.ev_x, false)
+    }
+
+    /// Copy expert (li, e)'s raw weights (the arena's copy, else the file's) into staging buffer `base` on `g`'s side
+    /// stream once `free` (recorded by the main stream) has passed; the main stream waits for the copy. Returns the
+    /// expert's (gate, up, down) device pointers and (gate, down) type ids.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_expert(&self, g: &Gpu, li: usize, e: usize, base: u64, free: crate::gpu::Event, ready: crate::gpu::Event) -> Result<(u64, u64, u64, i32, i32)> {
+        let ex = &self.m.layers[li].experts[e];
+        let (gb, ub, db) = match self.arena.and_then(|a| a.get(li, e)) {
+            Some([g, u, dn]) => (g, u, dn),
+            None => (ex.gate.bytes(), ex.up.bytes(), ex.down.bytes()),
+        };
+        g.wait(free, true)?;
+        g.htod_side(base, gb)?;
+        g.htod_side(base + gb.len() as u64, ub)?;
+        g.htod_side(base + (gb.len() + ub.len()) as u64, db)?;
+        g.record(ready, true)?;
+        g.wait(ready, false)?;
+        Ok((base, base + gb.len() as u64, base + (gb.len() + ub.len()) as u64, type_id(ex.gate.ty), type_id(ex.down.ty)))
+    }
+
+    /// Prepare the aux GPUs for this layer's experts: x (shipped by prefill_ship_x), the token rows and weights, a
+    /// zeroed sum. Returns one queue per aux GPU with work (`spans[i]`: its resident experts, then the streamed ones it
+    /// was given, so the first copies overlap the resident experts' compute).
+    fn prefill_aux_begin<'a>(&'a self, pb: &PrefillBufs, li: usize, n: usize, spans: &[Vec<(usize, usize, usize)>], all_rows: &[i32], all_w: &[f32]) -> Result<Vec<(usize, ExpQueue<'a>, Vec<(usize, usize, usize)>)>> {
+        let d = self.m.cfg.dim;
+        // the host waits for the x copy only (an event), not for the rest of GPU0's queue: a full sync here stalled
+        // every layer behind the shared expert while no weights were copying
         self.g.event_sync(pb.ev_x)?;
-        for (a, spans) in self.aux.iter().zip(spans) {
+        let xh = unsafe { std::slice::from_raw_parts(pb.x_host.host_ptr() as *const u16, n * d) };
+        let nr = all_rows.len();
+        let mut qs = vec![];
+        for (i, (a, spans)) in self.aux.iter().zip(spans).enumerate() {
             if spans.is_empty() {
                 continue;
             }
             let (g1, gp, s1) = (&a.g, a.pre.as_ref().unwrap(), &a.exp);
-            g1.htod(gp.x16.ptr, &xh[..])?;
-            g1.htod_sync(gp.rows.ptr, all_rows)?;
-            g1.htod_sync(gp.wrow.ptr, all_w)?;
+            // token rows and weights through pinned memory, so the uploads queue without a host sync (the previous
+            // layer's copies are done: prefill_moe synced this GPU before adding its sum)
+            let (rows_h, w_h) = unsafe {
+                let p = gp.idx_host.host_ptr();
+                std::ptr::copy_nonoverlapping(all_rows.as_ptr() as *const u8, p, nr * 4);
+                std::ptr::copy_nonoverlapping(all_w.as_ptr() as *const u8, p.add(nr * 4), nr * 4);
+                (std::slice::from_raw_parts(p as *const i32, nr), std::slice::from_raw_parts(p.add(nr * 4) as *const f32, nr))
+            };
+            g1.htod(gp.x16.ptr, xh)?;
+            g1.htod(gp.rows.ptr, rows_h)?;
+            g1.htod(gp.wrow.ptr, w_h)?;
             g1.memset(gp.out.ptr, n * d * 4)?;
-            for &(e, off, nt) in spans {
-                let (wg, wu, wd, gt, dt) = s1.slot_ptrs(li, e).unwrap();
-                let rows_p = gp.rows.ptr + (off * 4) as u64;
-                let w_p = gp.wrow.ptr + (off * 4) as u64;
-                g1.launch(gp.k["gather_h"], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(gp.x16.ptr), Arg::P(rows_p), Arg::P(gp.gx16.ptr), Arg::I(d as i32)])?;
-                if rot {
-                    // rotated experts store W.R: rotate the activations (R x), not the weights
-                    g1.launch(gp.k["fwht_rows_f16"], ((d / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(gp.gx16.ptr), Arg::I(d as i32)])?;
-                }
-                for (wp, yp) in [(wg, gp.gg.ptr), (wu, gp.gu.ptr)] {
-                    g1.launch(dq_kernel(&gp.k, gt, d), dq_grid(gt, inter, d), 256, 0, &[Arg::I(gt), Arg::P(wp), Arg::P(0), Arg::P(gp.w16.ptr), Arg::I(inter as i32), Arg::I(d as i32)])?;
-                    g1.gemm_f16(gp.gx16.ptr, gp.w16.ptr, yp, nt, d, inter, inter)?;
-                }
-                g1.launch(gp.k["swiglu_rows_f16"], ((inter as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(gp.gg.ptr), Arg::P(gp.gu.ptr), Arg::P(w_p), Arg::P(gp.h16.ptr), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
-                if rot {
-                    g1.launch(gp.k["fwht_rows_f16"], ((inter / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(gp.h16.ptr), Arg::I(inter as i32)])?;
-                }
-                g1.launch(dq_kernel(&gp.k, dt, inter), dq_grid(dt, d, inter), 256, 0, &[Arg::I(dt), Arg::P(wd), Arg::P(0), Arg::P(gp.w16.ptr), Arg::I(d as i32), Arg::I(inter as i32)])?;
-                g1.gemm_f16(gp.h16.ptr, gp.w16.ptr, gp.go.ptr, nt, inter, d, d)?;
-                if let Some(rel) = noise_rel(li) {
-                    g1.launch(gp.k["add_noise_rows"], (nt as u32, 1, 1), 256, 0, &[Arg::P(gp.go.ptr), Arg::I(d as i32), Arg::F(rel), Arg::I((li * 1000 + e + 1) as i32)])?;
-                }
-                g1.launch(gp.k["scatter_add"], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(gp.go.ptr), Arg::P(rows_p), Arg::P(gp.out.ptr), Arg::I(d as i32)])?;
-            }
-            let oh = unsafe { std::slice::from_raw_parts_mut(gp.out_host.host_ptr() as *mut f32, n * d) };
-            g1.dtoh(oh, gp.out.ptr)?;
+            let (mut list, streamed): (Vec<_>, Vec<_>) = spans.iter().partition(|s| s1.slot_ptrs(li, s.0).is_some());
+            anyhow::ensure!(streamed.is_empty() || !gp.estage.is_empty(), "streamed experts given to an aux GPU without staging buffers");
+            list.extend(streamed);
+            let q = ExpQueue { g: g1, k: &gp.k, gather: "gather_h", x: gp.x16.ptr, rows: gp.rows.ptr, wrow: gp.wrow.ptr, gx16: gp.gx16.ptr, gg: gp.gg.ptr, gu: gp.gu.ptr, h16: gp.h16.ptr, go: gp.go.ptr, w16: gp.w16.ptr, out: gp.out.ptr, store: Some(s1), estage: &gp.estage, ev_ready: &gp.ev_ready, ev_free: &gp.ev_free, nstaged: 0 };
+            q.start()?;
+            qs.push((i, q, list.into_iter().copied().collect()));
         }
         self.g.bind();
+        Ok(qs)
+    }
+
+    /// Enqueue one routed expert on `q`'s GPU over its `nt` token rows starting at `off`: weights from the GPU's
+    /// store, else staged from the arena; the weighted output is added into q.out.
+    fn queue_expert(&self, q: &mut ExpQueue, li: usize, e: usize, off: usize, nt: usize) -> Result<()> {
+        let c = &self.m.cfg;
+        let (d, inter) = (c.dim, c.inter);
+        let rot = c.expert_rot[li];
+        let g = q.g;
+        let rows_p = q.rows + (off * 4) as u64;
+        let w_p = q.wrow + (off * 4) as u64;
+        g.launch(q.k[q.gather], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(q.x), Arg::P(rows_p), Arg::P(q.gx16), Arg::I(d as i32)])?;
+        if rot {
+            // rotated experts store W.R: rotate the activations (R x, R h), not the weights
+            g.launch(q.k["fwht_rows_f16"], ((d / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(q.gx16), Arg::I(d as i32)])?;
+        }
+        // expert weights on the device: the GPU's store, else copied on its side stream into one of the staging
+        // buffers while the main stream computes the previous experts
+        let mut staged = None;
+        let (gp, up, dp, gt, dt) = match q.store.and_then(|s| s.slot_ptrs(li, e)) {
+            Some(p) => p,
+            None => {
+                let b = q.nstaged % NSTAGE;
+                q.nstaged += 1;
+                staged = Some(b);
+                self.stage_expert(g, li, e, q.estage[b].ptr, q.ev_free[b], q.ev_ready[b])?
+            }
+        };
+        for (wp, yp) in [(gp, q.gg), (up, q.gu)] {
+            g.launch(dq_kernel(q.k, gt, d), dq_grid(gt, inter, d), 256, 0, &[Arg::I(gt), Arg::P(wp), Arg::P(0), Arg::P(q.w16), Arg::I(inter as i32), Arg::I(d as i32)])?;
+            g.gemm_f16(q.gx16, q.w16, yp, nt, d, inter, inter)?;
+        }
+        g.launch(q.k["swiglu_rows_f16"], ((inter as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(q.gg), Arg::P(q.gu), Arg::P(w_p), Arg::P(q.h16), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
+        if rot {
+            g.launch(q.k["fwht_rows_f16"], ((inter / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(q.h16), Arg::I(inter as i32)])?;
+        }
+        g.launch(dq_kernel(q.k, dt, inter), dq_grid(dt, d, inter), 256, 0, &[Arg::I(dt), Arg::P(dp), Arg::P(0), Arg::P(q.w16), Arg::I(d as i32), Arg::I(inter as i32)])?;
+        g.gemm_f16(q.h16, q.w16, q.go, nt, inter, d, d)?;
+        if let Some(rel) = noise_rel(li) {
+            g.launch(q.k["add_noise_rows"], (nt as u32, 1, 1), 256, 0, &[Arg::P(q.go), Arg::I(d as i32), Arg::F(rel), Arg::I((li * 1000 + e + 1) as i32)])?;
+        }
+        g.launch(q.k["scatter_add"], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(q.go), Arg::P(rows_p), Arg::P(q.out), Arg::I(d as i32)])?;
+        if let Some(b) = staged {
+            g.record(q.ev_free[b], false)?;
+        }
         Ok(())
     }
 
@@ -758,7 +887,6 @@ impl GpuModel<'_> {
     }
 
     fn prefill_moe(&mut self, pb: &PrefillBufs, li: usize, r0: usize, n: usize) -> Result<()> {
-        let rot = self.m.cfg.expert_rot[li];
         let m = self.m;
         let c = &m.cfg;
         let (d, inter) = (c.dim, c.inter);
@@ -811,17 +939,36 @@ impl GpuModel<'_> {
         }
         self.g.htod_sync(pb.rows.ptr, &all_rows)?;
         self.g.htod_sync(pb.wrow.ptr, &all_w)?;
-        // the aux GPUs' resident experts: ship x there, run them concurrently, add their sums at the end
-        let aux_spans: Vec<Vec<(usize, usize, usize)>> = self
-            .aux
-            .iter()
-            .map(|a| if a.pre.is_some() && !self.skip_experts { spans.iter().cloned().filter(|&(e, _, _)| a.exp.has(li, e)).collect() } else { vec![] })
-            .collect();
+        // each aux GPU takes its resident experts; the experts on no GPU stream in over the main GPU's link and the
+        // streaming aux GPUs' links, each to the GPU whose link frees up first (bytes / relative link speed, an aux
+        // GPU starting with the f16 x it receives and the f32 sum it sends back). Link speeds count in quarters of the
+        // main GPU's, so run-to-run noise in the startup measurement does not move experts between GPUs (which
+        // changes the order of the f32 sums, and so the output in the last bits)
+        let streamers: Vec<usize> = (0..self.aux.len()).filter(|&i| !self.skip_experts && self.aux[i].pre.as_ref().is_some_and(|p| !p.estage.is_empty())).collect();
+        let rel = |gbs: f64| ((gbs / self.main_gbs * 4.0).round() / 4.0).max(0.25);
+        let bw: Vec<f64> = std::iter::once(stream_main_weight()).chain(streamers.iter().map(|&i| rel(self.aux[i].pre.as_ref().unwrap().link_gbs))).collect();
+        let mut queued: Vec<f64> = bw.iter().enumerate().map(|(j, b)| if j == 0 { 0.0 } else { (n * d * 6) as f64 / b }).collect();
+        let mut aux_spans: Vec<Vec<(usize, usize, usize)>> = vec![vec![]; self.aux.len()];
+        let mut main_spans = Vec::with_capacity(spans.len());
+        for sp in spans {
+            let e = sp.0;
+            if self.exp0.as_ref().is_some_and(|s| s.has(li, e)) {
+                main_spans.push(sp);
+            } else if let Some(i) = self.aux.iter().position(|a| a.pre.is_some() && !self.skip_experts && a.exp.has(li, e)) {
+                aux_spans[i].push(sp);
+            } else {
+                let ex = &ml.experts[e];
+                let bytes = (ex.gate.bytes().len() + ex.up.bytes().len() + ex.down.bytes().len()) as f64;
+                let j = (0..bw.len()).min_by(|&i, &j| (queued[i] + bytes / bw[i]).total_cmp(&(queued[j] + bytes / bw[j]))).unwrap();
+                queued[j] += bytes / bw[j];
+                if j == 0 { main_spans.push(sp) } else { aux_spans[streamers[j - 1]].push(sp) }
+            }
+        }
+        let spans = main_spans;
         let use_aux = aux_spans.iter().any(|v| !v.is_empty());
         if use_aux {
-            self.prefill_moe_aux(pb, li, x, n, &aux_spans, &all_rows, &all_w)?;
+            self.prefill_ship_x(pb, x, n)?;
         }
-        let spans: Vec<(usize, usize, usize)> = spans.into_iter().filter(|&(e, _, _)| !aux_spans.iter().any(|v| v.iter().any(|s| s.0 == e))).collect();
         let tp1 = std::time::Instant::now();
         // shared expert over all rows -> out
         self.gemm(pb, &l.sh_gate, x, pb.gg.ptr, n)?;
@@ -850,62 +997,26 @@ impl GpuModel<'_> {
             return Ok(());
         }
         self.prof_mark("prefill moe . router+shared+aux ship", tp0)?;
-        let mut nstaged = 0usize;
-        // the side stream must not start copying before the main stream reaches this layer's experts
-        for e in pb.ev_free.iter() {
-            self.g.record(*e, false)?;
+        // the aux GPUs start once x has reached pinned memory (queued ahead of the shared expert, which covers the wait)
+        let mut qs = if use_aux { self.prefill_aux_begin(pb, li, n, &aux_spans, &all_rows, &all_w)? } else { vec![] };
+        let main = ExpQueue { g: &self.g, k: &self.k, gather: "gather_f16", x, rows: pb.rows.ptr, wrow: pb.wrow.ptr, gx16: pb.gx16.ptr, gg: pb.gg.ptr, gu: pb.gu.ptr, h16: pb.h16.ptr, go: pb.go.ptr, w16: pb.w16.ptr, out: pb.out.ptr, store: self.exp0.as_ref(), estage: &pb.estage, ev_ready: &pb.ev_ready, ev_free: &pb.ev_free, nstaged: 0 };
+        main.start()?;
+        qs.insert(0, (usize::MAX, main, spans));
+        // enqueue round-robin by progress through each GPU's list: a CUDA stream takes ~1K queued operations before
+        // the host blocks, so queueing one GPU's whole layer first would idle the others behind it
+        let mut next = vec![0usize; qs.len()];
+        while let Some(j) = (0..qs.len()).filter(|&j| next[j] < qs[j].2.len()).min_by(|&a, &b| (next[a] as f64 / qs[a].2.len() as f64).total_cmp(&(next[b] as f64 / qs[b].2.len() as f64))) {
+            let (e, off, nt) = qs[j].2[next[j]];
+            next[j] += 1;
+            self.queue_expert(&mut qs[j].1, li, e, off, nt)?;
         }
-        for &(e, off, nt) in &spans {
-            let rows_p = pb.rows.ptr + (off * 4) as u64;
-            let w_p = pb.wrow.ptr + (off * 4) as u64;
-            self.g.launch(self.k["gather_f16"], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(x), Arg::P(rows_p), Arg::P(pb.gx16.ptr), Arg::I(d as i32)])?;
-            if rot {
-                // rotated experts store W.R: rotate the activations (R x, R h), not the weights
-                self.g.launch(self.k["fwht_rows_f16"], ((d / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(pb.gx16.ptr), Arg::I(d as i32)])?;
-            }
-            // expert weights on the device: GPU0 store, else copied on the side stream into one of two staging
-            // buffers while the main stream computes the previous expert (double buffering)
-            let ex = &ml.experts[e];
-            let mut staged = None;
-            let (gp, up, dp, gt, dt) = match self.exp0.as_ref().and_then(|s| s.slot_ptrs(li, e)) {
-                Some(p) => p,
-                None => {
-                    let (gb, ub, db) = match self.arena.and_then(|a| a.get(li, e)) {
-                        Some([g, u, dn]) => (g, u, dn),
-                        None => (ex.gate.bytes(), ex.up.bytes(), ex.down.bytes()),
-                    };
-                    let b = nstaged % NSTAGE;
-                    nstaged += 1;
-                    let base = pb.estage[b].ptr;
-                    self.g.wait(pb.ev_free[b], true)?; // the main stream is done with this buffer's previous expert
-                    self.g.htod_side(base, gb)?;
-                    self.g.htod_side(base + gb.len() as u64, ub)?;
-                    self.g.htod_side(base + (gb.len() + ub.len()) as u64, db)?;
-                    self.g.record(pb.ev_ready[b], true)?;
-                    self.g.wait(pb.ev_ready[b], false)?;
-                    staged = Some(b);
-                    (base, base + gb.len() as u64, base + (gb.len() + ub.len()) as u64, type_id(ex.gate.ty), type_id(ex.down.ty))
-                }
-            };
-            for (wp, yp) in [(gp, pb.gg.ptr), (up, pb.gu.ptr)] {
-                self.g.launch(dq_kernel(&self.k, gt, d), dq_grid(gt, inter, d), 256, 0, &[Arg::I(gt), Arg::P(wp), Arg::P(0), Arg::P(pb.w16.ptr), Arg::I(inter as i32), Arg::I(d as i32)])?;
-                self.g.gemm_f16(pb.gx16.ptr, pb.w16.ptr, yp, nt, d, inter, inter)?;
-            }
-            self.g.launch(self.k["swiglu_rows_f16"], ((inter as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(pb.gg.ptr), Arg::P(pb.gu.ptr), Arg::P(w_p), Arg::P(pb.h16.ptr), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
-            if rot {
-                self.g.launch(self.k["fwht_rows_f16"], ((inter / 128) as u32, nt as u32, 1), 128, 0, &[Arg::P(pb.h16.ptr), Arg::I(inter as i32)])?;
-            }
-            self.g.launch(dq_kernel(&self.k, dt, inter), dq_grid(dt, d, inter), 256, 0, &[Arg::I(dt), Arg::P(dp), Arg::P(0), Arg::P(pb.w16.ptr), Arg::I(d as i32), Arg::I(inter as i32)])?;
-            self.g.gemm_f16(pb.h16.ptr, pb.w16.ptr, pb.go.ptr, nt, inter, d, d)?;
-            if let Some(rel) = noise_rel(li) {
-                self.g.launch(self.k["add_noise_rows"], (nt as u32, 1, 1), 256, 0, &[Arg::P(pb.go.ptr), Arg::I(d as i32), Arg::F(rel), Arg::I((li * 1000 + e + 1) as i32)])?;
-            }
-            self.g.launch(self.k["scatter_add"], ((d as u32).div_ceil(256), nt as u32, 1), 256, 0, &[Arg::P(pb.go.ptr), Arg::P(rows_p), Arg::P(pb.out.ptr), Arg::I(d as i32)])?;
-            if let Some(b) = staged {
-                self.g.record(pb.ev_free[b], false)?;
-            }
+        for (i, q, _) in qs.iter().skip(1) {
+            let oh = unsafe { std::slice::from_raw_parts_mut(self.aux[*i].pre.as_ref().unwrap().out_host.host_ptr() as *mut f32, n * d) };
+            q.g.dtoh(oh, q.out)?;
         }
-        self.prof_mark("prefill moe . GPU0 expert loop", tp1)?;
+        drop(qs);
+        self.g.bind();
+        self.prof_mark("prefill moe . expert loops", tp1)?;
         let tp2 = std::time::Instant::now();
         for (a, sp) in self.aux.iter().zip(&aux_spans) {
             if sp.is_empty() {

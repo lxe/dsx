@@ -26,10 +26,11 @@ cargo test --release -p dsx --features cuda     # + GPU kernel tests (gemv vs CP
 Debug: `DSX_DUMP=dir` (per-layer residual streams, ref vs GPU), `DSX_ROUTES=1` (expert picks), `DSX_PROF=1` (time per section),
 `DSX_SYNC_MOE=1` (old host-synchronous expert path), `DSX_MOE_DEVICE=1` (device-driven expert kernels in the sync path),
 `DSX_OLD_MOE=1` (VRAM experts keep their GGUF blocks and run moe_gu / moe_down instead of the repacked int8-mma kernels).
-Placement experiments: `DSX_GPUS=0,2`, `DSX_AUX_ADAPTIVE=1/0`, `DSX_ADAPT=N`, `DSX_ADAPT_AUX=N` (in-flight swaps on other
-GPUs), `DSX_DECAY=x` (usage decay per token, default 0.97), `DSX_ROUTE_BIAS=x` (selection bonus for VRAM experts; changes
-the model's routing). Profiling: `DSX_EVPROF=1` (GPU event times per decode stage). Sensitivity: `DSX_NOISE=A-B:REL`
-(Gaussian noise on layers A..B's routed expert outputs in prefill).
+Placement experiments: `DSX_GPUS=0,2`, `DSX_AUX_ADAPTIVE=1/0`, `DSX_AUX_STREAM=1/0` (other GPUs' share of prefill's
+expert stream), `DSX_STREAM_MAIN_W=x` (the main GPU's weight in that split, default 2), `DSX_ADAPT=N`, `DSX_ADAPT_AUX=N`
+(in-flight swaps on other GPUs), `DSX_DECAY=x` (usage decay per token, default 0.97), `DSX_ROUTE_BIAS=x` (selection
+bonus for VRAM experts; changes the model's routing). Profiling: `DSX_EVPROF=1` (GPU event times per decode stage).
+Sensitivity: `DSX_NOISE=A-B:REL` (Gaussian noise on layers A..B's routed expert outputs in prefill).
 
 ## Layout
 

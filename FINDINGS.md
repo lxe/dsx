@@ -53,7 +53,8 @@ included. A V4.1 quant is not a 1017 quant.
 | Disk | NVMe, ~6 GB/s sequential |
 
 Two properties shape everything: RAM bandwidth is the slow tier, and GPU1's link is too slow to stream experts, so it
-holds a fixed set.
+holds a fixed set. Where both GPUs sit on CPU lanes at the same speed, GPU1 becomes a second cache and a second prefill
+stream (section 8c).
 
 ## 3. Performance model
 
@@ -263,6 +264,54 @@ Acting on the one-layer-early prediction did not pay: reading the next layer's 1
 cache after each layer (one more pass over ~9 MB each, on the CPU worker) left decode at 29.3 tok/s with 1 and slowed it
 to 27.4 and 25.1 tok/s with 2 and 3. The prefetch pass costs ~6.5 ms per token per expert and often delays the next
 layer's real work; the code was dropped.
+
+## 8c. Two GPUs on x16 links: GPU1 as a second cache and a second stream
+
+On a host with both RTX 3090s on CPU lanes (i9-10900X / X299, PCIe 3.0 x16 each, `nvidia-smi topo` NODE, 156 GB
+DDR4), `bench/pcie.cu` measures 12.4 GB/s host-to-device on each GPU, also with both copying at once (the reference
+machine: 24.7 GB/s on GPU0, 3.3 on GPU1). The x4 rule "GPU1 holds a fixed set and carries only activations" no
+longer applies, and during decode GPU1 idled at 0-44% while GPU0 ran at 94-100%.
+
+Two changes give GPU1 work. Both follow the measured link (at least half the main GPU's bandwidth) and can be forced
+with `DSX_AUX_ADAPTIVE` / `DSX_AUX_STREAM`, so an x4 host keeps the old behavior:
+
+- **Adaptive GPU1 cache** (upstream's automatic placement): GPU1's 23 GB swap experts after every token like GPU0's
+  cache. Its experts then need RAM copies: the arena grows from 114.5 GB (fixed GPU1, everything fits) to ~138 GB.
+  With `--arena-gb 110`, 3,531 experts stay in the file and both prefill and decode lose (table below); with 135,
+  346. dsx therefore keeps GPU1's set fixed when the arena would leave more than 5% of the expert bytes in the file.
+- **Prefill streams over both links:** each expert no GPU holds goes to the GPU whose queued copies finish first, the
+  main GPU's link counting twice. GPU1 also computes its larger resident set (2,181 experts against GPU0's ~1,100),
+  and at 12.4 GB/s an expert's compute costs about as much as its copy. Warm 8K prefill with all streamed experts on
+  GPU0 15.6 s; split by link 14.4-15.4 s; GPU0 weighted 1.5 / 2 / 2.5 / 3: 13.3-14.0 / 12.9-13.3 / 13.2-13.4 /
+  13.5 s. The host enqueues both GPUs' expert work round-robin: queueing GPU1's whole layer first filled its stream's
+  ~1K-entry launch queue and blocked the host while GPU0 idled (prefill 385 tok/s, slower than without the split).
+
+Measured with `dsx gen` (one cold process per row: first prefill after load, then greedy decode) and with `dsx eval
+--decode` on 8 x 1023 tokens of held-out code (the same tokens for every row, so decode speed compares placements on
+identical text):
+
+| | Prefill 64K | Prefill 3K | Decode, identical text | Perplexity (decode) |
+|---|---:|---:|---:|---:|
+| Before: GPU1 fixed, GPU0 streams alone, arena 110 | 441 tok/s | 273 tok/s | 25.8 tok/s | 2.305 |
+| GPU1 fixed, prefill over both links, arena 110 | **505 tok/s** | – | 26.0 tok/s (arena 135) | 2.303 |
+| GPU1 adaptive, prefill over both links, arena 110 | 443 tok/s | 169 tok/s | 21.6 tok/s | 2.310 |
+| **GPU1 adaptive, prefill over both links, arena 135** | **503 tok/s (+14%)** | **335 tok/s (+23%)** | **28.8 tok/s (+11%)** | 2.318 |
+
+The binary llama-swap ran before (upstream b4e19e0) measured 450 tok/s on 64K and 275 on 3K with the same flags.
+Free-running decode after the prompts moved by +-2 tok/s between rows because each placement rounds differently and
+generates different text; the teacher-forced column is the comparison. A bigger arena alone does not speed up decode
+with a fixed GPU1 (25.8 vs 26.0 tok/s): the gain is GPU1's cache following the text (CPU share of picks 24-26% ->
+17-22%).
+
+Quality: prefill-path perplexity on the same 8K tokens is 2.313 without the split, 2.308 with it, 2.313 adaptive
+(decode reference 2.307). `dsx cmp` against the CPU reference over 32 tokens: top-1 matches 28/32 (adaptive, arena
+135) and 30/32 (before), median max logit difference 1.80 / 1.92. Moving an expert between GPUs changes the order of
+the f32 partial sums, which moves an 8K prompt's final logits by up to ~4-5 (routing near-ties flip downstream), so
+the split counts link speeds in quarters of the main GPU's: run-to-run noise in the startup measurement then does not
+change the output.
+
+Not split: with the expert stream halved, an 8K prefill spends ~4.4 s gathering Engram rows from disk on the host while
+both GPUs wait (`DSX_PROF`), next to ~2.8 s of attention.
 
 ## 9. Negative results
 

@@ -11,6 +11,7 @@ Sources: `membw.c`, `qdot.c` (synthetic weights, real kernels), `pcie.cu`, and `
 | Host-to-device, GPU0, pinned 4 KB pages | 13 GB/s | the IOMMU halves DMA from small pages |
 | Host-to-device, GPU0, hugepage memory + `cudaHostRegister` | **24.7 GB/s** | the RAM arena must be hugepage-backed |
 | Host-to-device, GPU1 (PCIe 3.0 x4) | 3.3 GB/s | GPU1 holds a fixed expert set |
+| Host-to-device, both GPUs on PCIe 3.0 x16 CPU lanes (i9-10900X / X299), each alone and both at once | 12.4 + 12.4 GB/s | GPU1 swaps experts and takes half of prefill's stream (FINDINGS 8c) |
 | Kernel launch: back-to-back / in a CUDA graph / launch + sync | 1.17 / 0.58 / 3.8-5.2 µs | |
 | GPU → CPU → GPU flag round trip (mapped memory, `cuStreamWaitValue32`) | **5.3 µs** GPU0, 8.5 µs GPU1 | a per-layer CPU handoff is cheap |
 

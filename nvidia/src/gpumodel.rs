@@ -191,6 +191,8 @@ pub struct GpuModel<'m> {
     prof_host: bool,
     /// the exchange's address in the main GPU's context
     xch_dev: u64,
+    /// the main GPU's host -> device GB/s (weighs its share of prefill's streamed experts against streaming aux GPUs)
+    main_gbs: f64,
     seq_base: u32,
     pub n_routed: [usize; 3], // routed expert evaluations served by the main GPU, the aux GPUs, the CPU
     /// DSX_EVPROF=1: timed events per decode layer on the main GPU ([layer][EV_N]) and each aux GPU; ms sums per stage
@@ -448,6 +450,7 @@ impl<'m> GpuModel<'m> {
             skip_experts: std::env::var_os("DSX_SKIP_EXPERTS").is_some(),
             prof_host: std::env::var("DSX_PROF").is_ok_and(|v| v == "host"),
             xch_dev: 0,
+            main_gbs: probe.iter().find(|p| p.ordinal == ordinal).map_or(1.0, |p| p.h2d_gbs),
             seq_base: 0,
             layers,
             k,
@@ -488,27 +491,41 @@ impl<'m> GpuModel<'m> {
             (pl.gpu0_gb * 1e9) as usize
         };
         // aux GPUs: every other probed GPU, each with its free memory minus headroom and its prefill buffers
-        let mut aux_g: Vec<(Gpu, usize, bool, f64)> = vec![]; // GPU, expert bytes, adaptive, link GB/s
+        let mut aux_g: Vec<(Gpu, usize, bool, bool, f64)> = vec![]; // GPU, expert bytes, adaptive, streams prefill, link GB/s
         if pl.aux_gb != 0.0 {
             let main_bw = probe.iter().find(|p| p.ordinal == ordinal).map_or(0.0, |p| p.h2d_gbs);
-            let pre1 = if pl.prefill_chunk > 0 { pl.prefill_chunk * (c.dim * 16 + c.inter * 10 + 64) + c.inter * c.dim * 2 + (256 << 20) } else { 0 };
             let others = probe.iter().filter(|p| p.ordinal != ordinal).count();
             if others > crate::handoff::MAX_AUX {
                 eprintln!("{others} other GPUs: using the first {} (DSX_GPUS picks which)", crate::handoff::MAX_AUX);
             }
             for p in probe.iter().filter(|p| p.ordinal != ordinal).take(crate::handoff::MAX_AUX) {
                 let ga = Gpu::new(p.ordinal)?;
-                let bytes = if pl.aux_gb < 0.0 {
-                    let (free, _) = ga.mem_info()?;
-                    free.saturating_sub((-pl.aux_gb * 1e9) as usize + pre1)
-                } else {
-                    (pl.aux_gb * 1e9) as usize
-                };
-                // DSX_AUX_ADAPTIVE=1/0 overrides the link rule
-                let fast = std::env::var("DSX_AUX_ADAPTIVE").map_or(p.h2d_gbs >= 0.5 * main_bw, |v| v == "1");
-                aux_g.push((ga, bytes, gm.adapt > 0 && fast, p.h2d_gbs));
+                // a link at least half as fast as the main GPU's: the store swaps experts like the main one and takes a
+                // share of prefill's streamed experts (DSX_AUX_ADAPTIVE=1/0 and DSX_AUX_STREAM=1/0 override each)
+                let fast = p.h2d_gbs >= 0.5 * main_bw;
+                let adaptive = std::env::var("DSX_AUX_ADAPTIVE").map_or(fast, |v| v == "1");
+                let stream = pl.prefill_chunk > 0 && std::env::var("DSX_AUX_STREAM").map_or(fast, |v| v == "1");
+                let pre1 = if pl.prefill_chunk > 0 { prefill::aux_prefill_bytes(c, pl.prefill_chunk, stream) } else { 0 };
+                let (free, _) = ga.mem_info()?;
+                let bytes = if pl.aux_gb < 0.0 { free.saturating_sub((-pl.aux_gb * 1e9) as usize + pre1) } else { ((pl.aux_gb * 1e9) as usize).min(free.saturating_sub(pre1)) };
+                aux_g.push((ga, bytes, gm.adapt > 0 && adaptive, stream, p.h2d_gbs));
             }
             gm.g.bind();
+            // swapping aux stores need RAM copies of their experts: when the arena cannot hold them, they would push
+            // more than 5% of the expert bytes out to the file (prefill then streams those from the page cache, the CPU
+            // computes them from there), so the stores keep fixed sets unless DSX_AUX_ADAPTIVE=1 asks otherwise
+            let swap_bytes: usize = aux_g.iter().filter(|a| a.2).map(|a| a.1).sum();
+            if swap_bytes > 0 && pl.arena_gb > 0.0 && std::env::var_os("DSX_AUX_ADAPTIVE").is_none() {
+                let total: usize = m.layers.iter().flat_map(|l| l.experts.iter()).map(|x| x.gate.bytes().len() + x.up.bytes().len() + x.down.bytes().len()).sum();
+                let cap = (pl.arena_gb * 1e9) as usize;
+                let extra = total.saturating_sub(cap) - total.saturating_sub(cap + swap_bytes);
+                if extra > total / 20 {
+                    eprintln!("aux GPUs keep fixed expert sets: their RAM copies need ~{:.0} GB more arena than --arena-gb {} (DSX_AUX_ADAPTIVE=1 swaps anyway)", extra as f64 / 1e9, pl.arena_gb);
+                    for a in aux_g.iter_mut() {
+                        a.2 = false;
+                    }
+                }
+            }
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
         let rank: Option<Vec<(usize, usize)>> = match &pl.rank {
@@ -546,7 +563,7 @@ impl<'m> GpuModel<'m> {
                 gm.exp0 = Some(s0);
             }
             let mut msg = format!("experts resident: GPU{ordinal} {} ({:.1} GB)", sets[0].len(), gm.exp0.as_ref().map_or(0, |x| x.bytes) as f64 / 1e9);
-            for ((ga, _, adaptive, bw), set) in aux_g.into_iter().zip(sets.iter().skip(1)) {
+            for ((ga, _, adaptive, stream, bw), set) in aux_g.into_iter().zip(sets.iter().skip(1)) {
                 if set.is_empty() {
                     continue;
                 }
@@ -557,8 +574,8 @@ impl<'m> GpuModel<'m> {
                     let n = std::env::var("DSX_ADAPT_AUX").ok().and_then(|v| v.parse().ok()).unwrap_or(gm.adapt);
                     exp.enable_swaps(&ga, n, max_raw)?;
                 }
-                let pre = if pl.prefill_chunk > 0 { Some(prefill::AuxPrefill::new(&ga, m, pl.prefill_chunk)?) } else { None };
-                msg += &format!(", GPU{} {} ({:.1} GB, {}, {bw:.1} GB/s link)", ga.ordinal, set.len(), exp.bytes as f64 / 1e9, if adaptive { "adaptive" } else { "static" });
+                let pre = if pl.prefill_chunk > 0 { Some(prefill::AuxPrefill::new(&ga, m, pl.prefill_chunk, stream, bw)?) } else { None };
+                msg += &format!(", GPU{} {} ({:.1} GB, {}{}, {bw:.1} GB/s link)", ga.ordinal, set.len(), exp.bytes as f64 / 1e9, if adaptive { "adaptive" } else { "static" }, if stream { ", streams prefill experts" } else { "" });
                 gm.aux.push(Aux { g: ga, exp, pre, xdev: 0, adaptive, ev: vec![] });
             }
             gm.g.bind();
