@@ -705,8 +705,70 @@ macro_rules! isa_kernels {
 
 
             /// Q2_K: exact unsigned scaled codes <=45, plus the separate minimum contribution.
+            /// Codes and per-16 scales are expanded in registers (shift/and, pshufb, one vpmullw); the byte
+            /// vectors fed to `dp` are the same as the former scalar build, so the result is bit-identical.
             #[target_feature(enable = $feat)]
             pub(super) unsafe fn rows_q2_k<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let nb = cols / 256;
+                let rb = nb * 84;
+                assert!(w.len() >= nr * rb);
+                let m3 = _mm256_set1_epi8(3);
+                let m15 = _mm_set1_epi8(15);
+                // group g (32 weights): lane 0 uses scale byte 2g, lane 1 byte 2g + 1.
+                // sw: the scale as the low byte of every i16 (high byte zeroed by index -128); since a lane's
+                // scale is uniform and code * scale <= 45, vpmullw yields both bytes' products without carry.
+                let sw: [__m256i; 8] = std::array::from_fn(|g| {
+                    let c: [i8; 32] = std::array::from_fn(|i| if i % 2 == 0 { (2 * g + i / 16) as i8 } else { -128 });
+                    unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) }
+                });
+                // sb: the scale byte broadcast to every byte of its lane (for the minimum codes)
+                let sb: [__m256i; 8] = std::array::from_fn(|g| {
+                    let c: [i8; 32] = std::array::from_fn(|i| (2 * g + i / 16) as i8);
+                    unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) }
+                });
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for b in 0..nb {
+                        unsafe {
+                            let p = w.as_ptr().add(r * rb + 84 * b);
+                            let s = _mm_loadu_si128(p as *const __m128i);
+                            let slo = _mm256_broadcastsi128_si256(_mm_and_si128(s, m15));
+                            let shi = _mm256_broadcastsi128_si256(_mm_and_si128(_mm_srli_epi16(s, 4), m15));
+                            let qs = [_mm256_loadu_si256(p.add(16) as *const __m256i), _mm256_loadu_si256(p.add(48) as *const __m256i)];
+                            let mut plus = [_mm256_setzero_si256(); T];
+                            let mut minus = [_mm256_setzero_si256(); T];
+                            for g in 0..8 {
+                                let q = qs[g / 4];
+                                let c = match g % 4 {
+                                    0 => q,
+                                    1 => _mm256_srli_epi16(q, 2),
+                                    2 => _mm256_srli_epi16(q, 4),
+                                    _ => _mm256_srli_epi16(q, 6),
+                                };
+                                let vv = _mm256_mullo_epi16(_mm256_and_si256(c, m3), _mm256_shuffle_epi8(slo, sw[g]));
+                                let mm = _mm256_shuffle_epi8(shi, sb[g]);
+                                for j in 0..T {
+                                    let x = ld(tp[j].x.add(b * 256 + g * 32));
+                                    plus[j] = dp(plus[j], vv, x);
+                                    minus[j] = dp(minus[j], mm, x);
+                                }
+                            }
+                            let d = _mm256_set1_ps(f16_ld(p.add(80)));
+                            let dm = _mm256_set1_ps(f16_ld(p.add(82)));
+                            for j in 0..T {
+                                let v = _mm256_sub_ps(_mm256_mul_ps(d, _mm256_cvtepi32_ps(plus[j])), _mm256_mul_ps(dm, _mm256_cvtepi32_ps(minus[j])));
+                                acc[j] = _mm256_fmadd_ps(v, _mm256_broadcast_ss(&*tp[j].d.add(b)), acc[j]);
+                            }
+                        }
+                    }
+                    for j in 0..T { unsafe { *out.add(j * os + r) = hsum(acc[j]); } }
+                }
+            }
+
+            /// Former scalar-build Q2_K kernel, kept only as the bit-identity reference for `rows_q2_k`.
+            #[cfg(test)]
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_q2_k_v1<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
                 let nb = cols / 256;
                 for r in 0..nr {
                     let mut acc = [_mm256_setzero_ps(); T];
@@ -757,15 +819,25 @@ macro_rules! isa_kernels {
                         let mut tot = [_mm256_setzero_si256(); T];
                         for g in 0..8 {
                             let sg = u32::from_le_bytes(p[66 + 4*g..70 + 4*g].try_into().unwrap());
-                            let mut v = [0i8; 32];
-                            for q in 0..8 {
-                                let grid = IQ3XXS_GRID[p[2 + 8*g + q] as usize].to_le_bytes();
-                                let sign = KSIGNS_IQ2XS[((sg >> (7 * (q/2))) & 127) as usize];
-                                for i in 0..4 { v[q*4+i] = if (sign >> (4*(q%2)+i)) & 1 != 0 { -(grid[i] as i8) } else { grid[i] as i8 }; }
-                            }
+                            // Keep codebook bytes unsigned; expand 4 sign masks with SIMD.
+                            let grids: [u32; 8] = std::array::from_fn(|q|
+                                IQ3XXS_GRID[p[2 + 8*g + q] as usize]);
+                            let signs = u32::from_le_bytes(std::array::from_fn(|q|
+                                KSIGNS_IQ2XS[((sg >> (7*q)) & 127) as usize]));
                             unsafe {
-                                let v = ld(v.as_ptr());
-                                let av = _mm256_abs_epi8(v);
+                                let av = _mm256_loadu_si256(grids.as_ptr() as *const __m256i);
+                                let broadcast = _mm256_setr_epi8(
+                                    0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,
+                                    2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3);
+                                let bits = _mm256_setr_epi8(
+                                    1,2,4,8,16,32,64,-128,1,2,4,8,16,32,64,-128,
+                                    1,2,4,8,16,32,64,-128,1,2,4,8,16,32,64,-128);
+                                let flags = _mm256_and_si256(
+                                    _mm256_shuffle_epi8(_mm256_set1_epi32(signs as i32), broadcast), bits);
+                                let negative = _mm256_xor_si256(
+                                    _mm256_cmpeq_epi8(flags, _mm256_setzero_si256()),
+                                    _mm256_set1_epi8(-1));
+                                let v = _mm256_or_si256(negative, _mm256_set1_epi8(1));
                                 let sc = _mm256_set1_epi32((2 * (sg >> 28) + 1) as i32);
                                 for j in 0..T {
                                     let x = _mm256_sign_epi8(ld(tp[j].x.add(b*256+g*32)), v);
@@ -1207,6 +1279,51 @@ pub mod tests {
                     }
                     assert!(e_sc < 1e-6, "{isa:?} {ty:?} cols {cols} T {t}: {e_sc}");
                     assert!(e_f32 < 2e-2, "{isa:?} {ty:?} cols {cols} T {t}: {e_f32}");
+                }
+            }
+        }
+    }
+
+    /// The register-built Q2_K kernel must reproduce the former scalar build bit for bit (same bytes into `dp`,
+    /// same lane sums), including saturated scales/codes, zero scales, negative d/dmin and extreme activations.
+    #[test]
+    fn q2k_v2_bit_identical_to_v1() {
+        let mut rng = Rng(0x51ed_270b_9a3c_4e1d);
+        for isa in simd_isas() {
+            for mode in 0..4 {
+                for &cols in &[5120usize, 2304] {
+                    for t in 1..=MAX_T {
+                        let nr = 29;
+                        let mut rows = rand_rows(GType::Q2K, nr, cols, &mut rng);
+                        for blk in rows.chunks_exact_mut(84) {
+                            match mode {
+                                1 => blk[..80].fill(0xff),
+                                2 => blk[..16].fill(0),
+                                3 => { blk[81] |= 0x80; blk[83] |= 0x80; } // negative d, dmin
+                                _ => {}
+                            }
+                        }
+                        let mut x: Vec<f32> = (0..t * cols).map(|_| rng.normal()).collect();
+                        if mode == 1 { for (i, v) in x.iter_mut().enumerate() { *v = if i % 3 == 0 { 1.0 } else if i % 3 == 1 { -1.0 } else { 0.0 }; } }
+                        let act = QAct::new(&x, t, cols, &[GType::Q2K]);
+                        let mut tp = [Tok { x: std::ptr::null(), o: std::ptr::null(), s: std::ptr::null(), d: std::ptr::null() }; MAX_T];
+                        for (j, p) in tp.iter_mut().enumerate().take(t) { *p = act.tok(j, GType::Q2K); }
+                        let (mut a, mut b) = (vec![0f32; t * nr], vec![0f32; t * nr]);
+                        macro_rules! both {
+                            ($m:ident, $n:literal) => { unsafe {
+                                $m::rows_q2_k_v1::<$n>(&rows, nr, cols, &tp, a.as_mut_ptr(), nr);
+                                $m::rows_q2_k::<$n>(&rows, nr, cols, &tp, b.as_mut_ptr(), nr);
+                            } };
+                        }
+                        macro_rules! by_t {
+                            ($m:ident) => { match t { 1 => both!($m, 1), 2 => both!($m, 2), 3 => both!($m, 3), 4 => both!($m, 4),
+                                5 => both!($m, 5), 6 => both!($m, 6), 7 => both!($m, 7), _ => both!($m, 8) } };
+                        }
+                        match isa { Isa::Vnni => by_t!(vnni), Isa::Vnni512 => by_t!(vnni512), _ => by_t!(avx2) }
+                        for i in 0..t * nr {
+                            assert_eq!(a[i].to_bits(), b[i].to_bits(), "{isa:?} mode {mode} cols {cols} T {t} i {i}: {} vs {}", a[i], b[i]);
+                        }
+                    }
                 }
             }
         }
