@@ -92,7 +92,7 @@ fn layout_bit(t: GType) -> u8 {
     match t {
         GType::Q2_0 => L_Q2,
         GType::Ptq1_0 => L_T1,
-        GType::Q3K | GType::Q8_0 | GType::Iq2Xxs | GType::Iq2Xs | GType::Iq2S | GType::Iq1S => 0,
+        GType::Q2K | GType::Iq3Xxs | GType::Q3K | GType::Q8_0 | GType::Iq2Xxs | GType::Iq2Xs | GType::Iq2S | GType::Iq1S => 0,
         _ => panic!("{t:?}: no CPU kernel"),
     }
 }
@@ -422,6 +422,8 @@ fn dot_rows_isa(isa: Isa, ty: GType, rows: &[u8], cols: usize, act: &QAct, toks:
         match ty {
             GType::Q2_0 => go!(rows_q2_0),
             GType::Ptq1_0 => go!(rows_ptq1_0),
+            GType::Q2K => go!(rows_q2_k),
+            GType::Iq3Xxs => go!(rows_iq3_xxs),
             GType::Q3K => go!(rows_q3_k),
             GType::Q8_0 => go!(rows_q8_0),
             GType::Iq2Xxs => go!(rows_iq2_xxs),
@@ -701,6 +703,87 @@ macro_rules! isa_kernels {
                 }
             }
 
+
+            /// Q2_K: exact unsigned scaled codes <=45, plus the separate minimum contribution.
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_q2_k<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                let nb = cols / 256;
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for b in 0..nb {
+                        let p = &w[(r * nb + b) * 84..][..84];
+                        let mut plus = [_mm256_setzero_si256(); T];
+                        let mut minus = [_mm256_setzero_si256(); T];
+                        for g in 0..8 {
+                            let mut v = [0u8; 32];
+                            let mut m = [0u8; 32];
+                            for i in 0..32 {
+                                let sc = p[2 * g + i / 16];
+                                v[i] = ((p[16 + (g / 4) * 32 + i] >> (2 * (g % 4))) & 3) * (sc & 15);
+                                m[i] = sc >> 4;
+                            }
+                            unsafe {
+                                let vv = ld(v.as_ptr() as *const i8);
+                                let mm = ld(m.as_ptr() as *const i8);
+                                for j in 0..T {
+                                    let x = ld(tp[j].x.add(b * 256 + g * 32));
+                                    plus[j] = dp(plus[j], vv, x);
+                                    minus[j] = dp(minus[j], mm, x);
+                                }
+                            }
+                        }
+                        unsafe {
+                            let d = _mm256_set1_ps(f16_ld(p.as_ptr().add(80)));
+                            let dm = _mm256_set1_ps(f16_ld(p.as_ptr().add(82)));
+                            for j in 0..T {
+                                let v = _mm256_sub_ps(_mm256_mul_ps(d, _mm256_cvtepi32_ps(plus[j])), _mm256_mul_ps(dm, _mm256_cvtepi32_ps(minus[j])));
+                                acc[j] = _mm256_fmadd_ps(v, _mm256_broadcast_ss(&*tp[j].d.add(b)), acc[j]);
+                            }
+                        }
+                    }
+                    for j in 0..T { unsafe { *out.add(j * os + r) = hsum(acc[j]); } }
+                }
+            }
+
+            /// IQ3_XXS: 4-weight grid entries, sign patterns, and odd integer scale per 32.
+            #[target_feature(enable = $feat)]
+            pub(super) unsafe fn rows_iq3_xxs<const T: usize>(w: &[u8], nr: usize, cols: usize, tp: &[Tok; MAX_T], out: *mut f32, os: usize) {
+                use crate::iqgrid::{IQ3XXS_GRID, KSIGNS_IQ2XS};
+                let nb = cols / 256;
+                for r in 0..nr {
+                    let mut acc = [_mm256_setzero_ps(); T];
+                    for b in 0..nb {
+                        let p = &w[(r * nb + b) * 98..][..98];
+                        let mut tot = [_mm256_setzero_si256(); T];
+                        for g in 0..8 {
+                            let sg = u32::from_le_bytes(p[66 + 4*g..70 + 4*g].try_into().unwrap());
+                            let mut v = [0i8; 32];
+                            for q in 0..8 {
+                                let grid = IQ3XXS_GRID[p[2 + 8*g + q] as usize].to_le_bytes();
+                                let sign = KSIGNS_IQ2XS[((sg >> (7 * (q/2))) & 127) as usize];
+                                for i in 0..4 { v[q*4+i] = if (sign >> (4*(q%2)+i)) & 1 != 0 { -(grid[i] as i8) } else { grid[i] as i8 }; }
+                            }
+                            unsafe {
+                                let v = ld(v.as_ptr());
+                                let av = _mm256_abs_epi8(v);
+                                let sc = _mm256_set1_epi32((2 * (sg >> 28) + 1) as i32);
+                                for j in 0..T {
+                                    let x = _mm256_sign_epi8(ld(tp[j].x.add(b*256+g*32)), v);
+                                    let dot = dp(_mm256_setzero_si256(), av, x);
+                                    tot[j] = _mm256_add_epi32(tot[j], _mm256_mullo_epi32(dot, sc));
+                                }
+                            }
+                        }
+                        unsafe {
+                            let dw = _mm256_set1_ps(f16_ld(p.as_ptr()) * 0.25);
+                            for j in 0..T {
+                                acc[j] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot[j]), _mm256_mul_ps(dw, _mm256_broadcast_ss(&*tp[j].d.add(b))), acc[j]);
+                            }
+                        }
+                    }
+                    for j in 0..T { unsafe { *out.add(j * os + r) = hsum(acc[j]); } }
+                }
+            }
 
             /// Q3_K: chunk (h, j) of 32 weights = 128h + 32j + l, natural order; code u = low2 | hbit << 2 in 0..7 (q = u - 4).
             /// maddubs + madd by the two 16-weight sub-scales, then -4 * sum(scale * s16) per block.
@@ -1058,12 +1141,15 @@ pub mod tests {
             GType::Q2_0 | GType::Q8_0 | GType::Iq2Xxs | GType::Iq2Xs | GType::Iq2S | GType::Iq1S => 0,
             GType::Ptq1_0 => 26,
             GType::Q3K => 108,
+            GType::Q2K => 80,
+            GType::Iq3Xxs => 0,
             _ => unreachable!(),
         };
         let range = if ty == GType::Q3K { 0.002 } else { 0.05 };
         for blk in v.chunks_exact_mut(bs) {
             let d = f16::from_f32(range * (0.5 + rng.f32()));
             blk[at..at + 2].copy_from_slice(&d.to_le_bytes());
+            if ty == GType::Q2K { blk[82..84].copy_from_slice(&f16::from_f32(0.015 * rng.f32()).to_le_bytes()); }
         }
     }
 
@@ -1100,7 +1186,7 @@ pub mod tests {
 
     fn kernels_match_scalar_on(isa: Isa) {
         let mut rng = Rng(0x9e3779b97f4a7c15);
-        for ty in [GType::Q2_0, GType::Ptq1_0, GType::Q3K, GType::Q8_0, GType::Iq2Xxs, GType::Iq2Xs, GType::Iq2S, GType::Iq1S] {
+        for ty in [GType::Q2K, GType::Iq3Xxs, GType::Q2_0, GType::Ptq1_0, GType::Q3K, GType::Q8_0, GType::Iq2Xxs, GType::Iq2Xs, GType::Iq2S, GType::Iq1S] {
             for &cols in &[5120usize, 2304] {
                 for t in [1usize, 3, 6, 8, 11] {
                     let nr = 37;
