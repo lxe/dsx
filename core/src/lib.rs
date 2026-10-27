@@ -8,6 +8,7 @@ pub mod gguf;
 pub mod iqgrid;
 pub mod model;
 pub mod numerics;
+mod page_cache;
 pub mod safetensors;
 pub mod server;
 pub mod t16;

@@ -613,7 +613,6 @@ impl Drop for HostBuf {
 
 unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
-    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
 
 /// /proc/pressure/memory's "some avg10" (percent of the last 10 s with a task stalled on memory)
@@ -652,18 +651,6 @@ unsafe fn fault_in_paced(ptr: *mut u8, size: usize, align: usize) {
     }
     if size > 1 << 30 && waited > 0.0 {
         eprintln!("host buffer: {:.1} GB faulted in, {waited:.1} s waiting on memory pressure", size as f64 / 1e9);
-    }
-}
-
-/// Drop `paths`' pages from the page cache (POSIX_FADV_DONTNEED), e.g. the model files after the GPUs' experts were
-/// read through the mmap, so a large hugepage allocation finds free memory instead of reclaiming and compacting
-/// (memory pressure from that got the server killed by systemd-oomd).
-pub fn drop_page_cache(paths: &[std::path::PathBuf]) {
-    use std::os::fd::AsRawFd;
-    for p in paths {
-        if let Ok(f) = std::fs::File::open(p) {
-            unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, 4) };
-        }
     }
 }
 

@@ -724,6 +724,21 @@ impl Model {
             src: Source::Hf(st),
         })
     }
+
+    /// Evict the model's and the Engram tables' file-backed pages from the page cache. Call after the GPUs have
+    /// copied what they need and before a large host allocation (the expert arena). The model stays usable; later
+    /// reads fault the weights back in from the files.
+    pub fn drop_page_cache(&self) {
+        match &self.src {
+            Source::Gguf(g) => g.drop_page_cache(),
+            Source::Hf(st) => st.drop_page_cache(),
+        }
+        match &self.engram {
+            Some(EngramTables::Fp8 { st, .. }) => st.drop_page_cache(),
+            Some(EngramTables::Table { _file: Some(g), .. }) => g.drop_page_cache(),
+            _ => {}
+        }
+    }
 }
 
 /// An HF tensor as a Mat: F8_E4M3 (+ .scale 32x32 blocks), I8 = packed FP4 (+ .scale per 32), BF16/F16/F32.

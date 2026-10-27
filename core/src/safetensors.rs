@@ -95,6 +95,17 @@ impl SafeTensors {
         }
     }
 
+    /// Evict this file's pages from the page cache. The mappings stay valid; later reads fault the file back in.
+    /// Call only when no worker is reading the weights concurrently.
+    pub fn drop_page_cache(&self) {
+        for m in self.maps.iter().flatten() {
+            crate::page_cache::drop_map(m);
+        }
+        for p in &self.files {
+            crate::page_cache::drop_file(p);
+        }
+    }
+
     pub fn get(&self, name: &str) -> Result<&StTensor> {
         self.tensors.get(name).with_context(|| format!("safetensors: no {name}"))
     }

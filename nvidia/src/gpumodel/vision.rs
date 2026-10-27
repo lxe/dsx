@@ -89,7 +89,7 @@ impl VisionWeights {
             });
         }
         let start = f("image_start")?;
-        Ok(VisionWeights {
+        let vw = VisionWeights {
             blocks,
             patch_w: raw("vision.patch_embed.proj.weight")?,
             patch_b: f("vision.patch_embed.proj.bias")?,
@@ -102,7 +102,9 @@ impl VisionWeights {
             start,
             end: f("image_end")?,
             newline: f("image_newline")?,
-        })
+        };
+        st.drop_page_cache();
+        Ok(vw)
     }
 }
 

@@ -684,12 +684,13 @@ impl<'m> GpuModel<'m> {
                         on_cpu[l][e] || (adaptive0 && gm.exp0.as_ref().unwrap().has(l, e)) || gm.aux.iter().any(|a| a.adaptive && a.exp.has(l, e))
                     })
                     .collect();
-                if let crate::model::Source::Gguf(g) = &m.src {
-                    crate::gpu::drop_page_cache(&g.paths);
-                }
+                m.drop_page_cache();
                 let t = std::time::Instant::now();
                 let (a, rest) = crate::experts::Arena::new(m, &cpu, (pl.arena_gb * 1e9) as usize)?;
                 eprintln!("arena: {} experts, {:.1} GB in {:.0} s; {} left in the file", a.slots.len(), a.bytes as f64 / 1e9, t.elapsed().as_secs_f64(), rest.len());
+                // If O_DIRECT was unavailable the arena filled through the mmap: evict those pages again now that the
+                // arena owns the bytes, before the server starts serving at near-full RAM.
+                m.drop_page_cache();
                 Some(Box::leak(Box::new(a)))
             } else {
                 None
