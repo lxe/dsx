@@ -109,7 +109,8 @@ __device__ __forceinline__ void mma16(int (&c)[4], unsigned a0, unsigned a1, int
 // b0/b1 = x of token g at the same k; the C fragment is c[0..3] = C rows g, g, g+8, g+8 x tokens 2q, 2q+1, 2q, 2q+1.
 // The mma is a cross-lane reduction: c needs A row g over all four k-slices of its quad and x of tokens 2q, 2q+1 over
 // all slices (row groups 2q, 2q+1, lanes 8q..8q+7). One shuffle per operand-slice gathers both; the dp4a chains then
-// sum the same products in another order, which integer arithmetic makes irrelevant (identical accumulators).
+// sum the same products in another order, which integer arithmetic makes irrelevant (identical accumulators);
+// mma32t accumulates into c exactly as mma32's +r asm does; mma16t overwrites c, matching mma16's zeroed accumulator.
 template <bool DP>
 __device__ __forceinline__ void mma32t(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
   if constexpr (!DP) mma32(c, a0, a1, a2, a3, b0, b1);

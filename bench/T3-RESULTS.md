@@ -75,3 +75,5 @@ flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-f648-3706-6489-f5e
 flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8 \
     ./target/release/t16-decode-probe
 ```
+
+Addendum (ad30020): accessor renamed `is_pre_sm80`, predicate `arch < 80`; probe JSON key now `pre_sm80`.

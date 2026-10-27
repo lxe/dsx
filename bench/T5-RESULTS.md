@@ -11,13 +11,15 @@ Host: debianv100s (`ssh dogda@192.168.2.216`), Tesla V100-PCIE-32GB (80 SMs, dri
   caller fails loudly on device instead of silently computing garbage. Signatures unchanged.
 - New `mma32t<DP>`/`mma16t<DP>` templates: DP = false calls the free IMMA functions (SM80+ path, unchanged
   semantics incl. ABL); DP = true replaces the m16n8k32 / m16n8k16 `.s8.s8.s32` IMMA with unrolled `dp4a` over the
-  same logical tile. The fragments already hold the mma layouts — lane 4g+q owns A rows g/g+8 at k = 4q+i and
-  16+4q+i and x of token g at the same k — so the emulation is pure operand exchange plus integer dot products:
-  per k-slice u, 4 quad-shuffles gather A row g's four slices (lanes `base|u`) and 4 shuffles gather x of tokens
-  2q/2q+1 (lanes `8q+u`, `8q+4+u`), then 16 (8 for mma16) `__dp4a` accumulate the same products the mma would sum.
-  Integer sums are order-free, so the accumulators are bit-identical to the IMMA's. mma16t keeps mma16's
-  reset-the-accumulator contract. Per mma32: 8 SHFL + 32 dp4a per lane; no smem, no extra syncs (tiles only reach
-  the mma in warp-uniform control flow).
+same logical tile. The fragments already hold the mma layouts — lane 4g+q owns A rows g/g+8 at k = 4q+i and
+16+4q+i and x of token g at the same k — so the emulation is pure operand exchange plus integer dot products:
+per k-slice u, 4 quad-shuffles gather A row g's four slices (lanes `base|u`) and 4 shuffles gather x of tokens
+2q/2q+1 (lanes `8q+u`, `8q+4+u`), then the dp4a chains accumulate the same products the mma would sum — per
+k-slice, mma32t<true> issues 8 SHFL + 8 dp4a (mma16t: 4 + 4).
+Integer sums are order-free, so the accumulators are bit-identical to the IMMA's. mma16t keeps mma16's
+reset-the-accumulator contract. Per full mma32 that is 32 SHFL + 32 dp4a per lane (mma16t: 16 + 16 per mma);
+shuffles, not dp4a, dominate the emulation on Volta. No smem, no extra syncs (tiles only reach the mma in
+warp-uniform control flow).
 - The `tile_*` templates and `tile_dot` take a `bool DP` parameter (default false); every `mma32`/`mma16` call site
   routes through `mma32t<DP>`/`mma16t<DP>`. Decode/fixup code is byte-identical between the arches.
 - The three kernels (`xgemv`, `moe_gu_fast`, `moe_down_fast`) share one body each via `*_k<DP>` device functions;
