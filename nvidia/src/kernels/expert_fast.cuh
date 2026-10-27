@@ -65,6 +65,9 @@ __device__ __forceinline__ void tab_copy(unsigned *dst, const void *src, int n) 
 __device__ __forceinline__ int comp4(const int4 &v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
 __device__ __forceinline__ float h2f(unsigned v, int hi) { return __half2float(__ushort_as_half((unsigned short)(hi ? v >> 16 : v))); }
 
+// IMMA m16n8k32 / m16n8k16 s8 need sm_75+: SM80+ uses the tensor cores, SM70 gets a placeholder body (wrong values,
+// never executed — every kernel that reaches here is an SM70 stub below until the Volta port lands).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void mma32(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, int b0, int b1) {
   if (ABL & 8) {
     c[0] += a0 ^ b0;
@@ -90,6 +93,17 @@ __device__ __forceinline__ void mma16(int (&c)[4], unsigned a0, unsigned a1, int
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                : "r"(a0), "r"(a1), "r"(b0));
 }
+#else
+__device__ __forceinline__ void mma32(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, int b0, int b1) {
+  c[0] += (int)(a0 ^ (unsigned)b0);  // SM70 placeholder: same shape, no IMMA; unreachable (callers are stubbed out)
+  c[1] += (int)(a1 ^ (unsigned)b1);
+  c[2] += (int)(a2 ^ (unsigned)b0);
+  c[3] += (int)(a3 ^ (unsigned)b1);
+}
+__device__ __forceinline__ void mma16(int (&c)[4], unsigned a0, unsigned a1, int b0) {
+  c[0] = c[1] = c[2] = c[3] = (int)(a0 ^ (unsigned)b0);  // SM70 placeholder, unreachable
+}
+#endif
 
 // A warp's view of one call: B fragment token g (lane >> 2) as activation vector xv (-1 = none), and the C columns'
 // tokens 2q, 2q + 1 as vectors c0, c1 (their scales and sums). acc[m][i]: C element i (rows g, g, g+8, g+8 x tokens
@@ -648,7 +662,9 @@ __device__ __forceinline__ bool ks_sum(float (&acc)[NM][4]) {
   return true;
 }
 
-// y [T][rows] = W x [T][k] for a repacked matrix (type ty), x from quant_act. grid ceil(rows / 16), block 32 * KS
+// y [T][rows] = W x [T][k] for a repacked matrix (type ty), x from quant_act. grid ceil(rows / 16), block 32 * KS.
+// SM70: stub (IMMA needs sm_75+); the Volta dp4a port lands in a later task.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_t *w, int rows, int k, int T,
                                                             const int8_t *xq, const float *xd, const short *xs, float *y) {
   int lane = threadIdx.x & 31, g = lane >> 2;
@@ -669,11 +685,19 @@ extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_
     if (ROWT > 1) __syncthreads();  // ks_sum's shared sums are rewritten by the next tile
   }
 }
+#else
+extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_t *w, int rows, int k, int T,
+                                                            const int8_t *xq, const float *xd, const short *xs, float *y) {
+  // SM70 stub: writes nothing
+}
+#endif
 
 // ---------------------------------------------------------------- device-driven experts, T <= 8 tokens
 // h [T][K][inter] = bf16(silu(min(gate x_t, lim)) * clamp(up x_t, -lim, lim) * w) for every (token, pick) whose expert
 // is resident; one y-block per plan entry, so an expert picked by several tokens is read once.
 // x: quant_act of x [T][dim] (which also wrote plan). grid (ceil(inter / 16), T * K), block 32 * KS.
+// SM70: stub, like xgemv above.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot *tab, int layer, int E, const int *plan,
                                                              const float *wts, int K, const uint8_t *store,
                                                              const int8_t *xq, const float *xd, const short *xs,
@@ -702,11 +726,21 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot 
     if (ROWT > 1) __syncthreads();
   }
 }
+#else
+extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot *tab, int layer, int E, const int *plan,
+                                                             const float *wts, int K, const uint8_t *store,
+                                                             const int8_t *xq, const float *xd, const short *xs,
+                                                             float *h, int inter, int dim, float lim) {
+  // SM70 stub: writes nothing
+}
+#endif
 
 // out [T][dim] = sum over each token's resident picks of down . h. hx: quant_act of h [T * K][inter].
 // One y-block per plan entry writes its partial sums (part [64][8][dim]); the last block of a row tile to finish adds
 // them in entry order (deterministic) into out. cnt [ceil(dim / 16)] zeroed once, reset by the last block.
 // grid (ceil(dim / 16), T * K), block 32 * KS.
+// SM70: stub, like xgemv above.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlot *tab, int layer, int E, const int *plan,
                                                                int K, const uint8_t *store, const int8_t *hq,
                                                                const float *hd, const short *hs, float *out, int inter,
@@ -757,6 +791,14 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlo
     if (ROWT > 1) __syncthreads();  // `last` and ks_sum's shared sums are rewritten by the next tile
   }
 }
+#else
+extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlot *tab, int layer, int E, const int *plan,
+                                                               int K, const uint8_t *store, const int8_t *hq,
+                                                               const float *hd, const short *hs, float *out, int inter,
+                                                               int dim, int T, float *part, int *cnt) {
+  // SM70 stub: writes nothing
+}
+#endif
 
 // ---------------------------------------------------------------- upload-time repacking
 __device__ __forceinline__ int q3_code(const uint8_t *b, int e) {  // signed value of weight e of a GGUF Q3_K block

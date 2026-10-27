@@ -539,6 +539,9 @@ extern "C" __global__ void sparse_attn_merge_rf(const float *part, int S, const 
 // softmax: 8 threads per head; PV phase warp w = 64-dim output slice for all 32 heads (64 f32 accumulators).
 #define TC_NT 32
 __device__ __forceinline__ uint32_t smem_u32(const void *p) { return (uint32_t)__cvta_generic_to_shared(p); }
+// ldmatrix needs sm_75, mma bf16 m16n8k16 and cp.async sm_80: SM70 never compiles them (the SM70 sparse-attention
+// port lands in a later task; until then the sparse_attn_tc* kernels below are SM70 stubs)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void *p) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
@@ -555,11 +558,14 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], 
 __device__ __forceinline__ void cp_async16(void *dst, const void *src, int sz) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_u32(dst)), "l"(src), "r"(sz));
 }
+#endif  // __CUDA_ARCH__ >= 800
 __device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
   __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
   return *(uint32_t *)&v;
 }
 
+// SM80 only (ldmatrix / mma bf16 / cp.async above); the SM70 port lands in a later task.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <bool SPLIT>
 __device__ __forceinline__ void sparse_attn_tc_body(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                     const __nv_bfloat16 *comp, const int *comp_idx, int K, const float *sinks,
@@ -754,7 +760,9 @@ __device__ __forceinline__ void sparse_attn_tc_body(const float *q, const __nv_b
     }
   }
 }
+#endif  // __CUDA_ARCH__ >= 800
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                   const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                   const float *sinks, float *o, int H, int hd, float scale) {
@@ -765,6 +773,18 @@ extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const floa
                                                                        const float *sinks, float *o, int H, int hd, float scale) {
   sparse_attn_tc_body<false>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
 }
+#else
+// SM70 stubs: same kernel names (loaded by name via cuModuleGetFunction) so the fatbin keeps its export surface;
+// the bodies write nothing until the real Volta port lands (Phase 3).
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                  const __nv_bfloat16 *comp, const int *comp_idx, int K,
+                                                                  const float *sinks, float *o, int H, int hd, float scale) {
+}
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                       const __nv_bfloat16 *comp, const int *comp_idx, int K,
+                                                                       const float *sinks, float *o, int H, int hd, float scale) {
+}
+#endif
 
 // store a [hd] f32 vector into a bf16 cache row
 extern "C" __global__ void store_bf16(const float *x, __nv_bfloat16 *dst, int n) {
@@ -1204,6 +1224,7 @@ extern "C" __global__ void swiglu_s(const float *g, const float *u, float *h, in
 #include "expert_fast.cuh"
 #include "dequant_iq8.cuh"
 #include "t16.cuh"
+#include "sm70.cuh"
 
 // ---------------------------------------------------------------- cross-device expert handoff (mapped host memory)
 // xch layout (bytes): route_flag @0, cpu_flag @64, gpu1_flag @128, ntok @192, sel[8][8] i32 @256, wts[8][8] f32 @512,
