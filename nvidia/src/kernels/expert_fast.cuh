@@ -65,8 +65,8 @@ __device__ __forceinline__ void tab_copy(unsigned *dst, const void *src, int n) 
 __device__ __forceinline__ int comp4(const int4 &v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
 __device__ __forceinline__ float h2f(unsigned v, int hi) { return __half2float(__ushort_as_half((unsigned short)(hi ? v >> 16 : v))); }
 
-// IMMA m16n8k32 / m16n8k16 s8 need sm_75+: SM80+ uses the tensor cores, SM70 gets a placeholder body (wrong values,
-// never executed — every kernel that reaches here is an SM70 stub below until the Volta port lands).
+// IMMA m16n8k32 / m16n8k16 s8 need sm_75+: SM80+ uses the tensor cores, SM70 traps (a caller that reached the free
+// functions below would be a bug — the fast kernels go through mma32t/mma16t with DP = true instead).
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void mma32(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, int b0, int b1) {
   if (ABL & 8) {
@@ -95,15 +95,66 @@ __device__ __forceinline__ void mma16(int (&c)[4], unsigned a0, unsigned a1, int
 }
 #else
 __device__ __forceinline__ void mma32(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, int b0, int b1) {
-  c[0] += (int)(a0 ^ (unsigned)b0);  // SM70 placeholder: same shape, no IMMA; unreachable (callers are stubbed out)
-  c[1] += (int)(a1 ^ (unsigned)b1);
-  c[2] += (int)(a2 ^ (unsigned)b0);
-  c[3] += (int)(a3 ^ (unsigned)b1);
+  c[0] = c[1] = c[2] = c[3] = 0;
+  __trap();  // SM70: no IMMA below sm_75. Fail loudly rather than compute garbage (call the DP port below instead).
 }
 __device__ __forceinline__ void mma16(int (&c)[4], unsigned a0, unsigned a1, int b0) {
-  c[0] = c[1] = c[2] = c[3] = (int)(a0 ^ (unsigned)b0);  // SM70 placeholder, unreachable
+  c[0] = c[1] = c[2] = c[3] = 0;
+  __trap();  // SM70, as mma32
 }
 #endif
+
+// The same two shapes on SM70, as dp4a (the fast kernels' DP = true path). The fragment layouts are the mma's: lane
+// 4g + q holds a0/a1 = A rows g, g+8 at k = 4q + i, a2/a3 = the same rows at k = 16 + 4q + i (mma16: just a0/a1), and
+// b0/b1 = x of token g at the same k; the C fragment is c[0..3] = C rows g, g, g+8, g+8 x tokens 2q, 2q+1, 2q, 2q+1.
+// The mma is a cross-lane reduction: c needs A row g over all four k-slices of its quad and x of tokens 2q, 2q+1 over
+// all slices (row groups 2q, 2q+1, lanes 8q..8q+7). One shuffle per operand-slice gathers both; the dp4a chains then
+// sum the same products in another order, which integer arithmetic makes irrelevant (identical accumulators).
+template <bool DP>
+__device__ __forceinline__ void mma32t(int (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+  if constexpr (!DP) mma32(c, a0, a1, a2, a3, b0, b1);
+  else {
+    const int lane = threadIdx.x & 31, q = lane & 3, base = lane & ~3, t = 8 * q;
+#pragma unroll
+    for (int u = 0; u < 4; u++) {  // slice u: gathered and consumed immediately (few live words)
+      unsigned X0 = __shfl_sync(0xffffffffu, a0, base | u);  // A rows g / g+8, k slice u of this quad
+      unsigned X1 = __shfl_sync(0xffffffffu, a1, base | u);
+      unsigned X2 = __shfl_sync(0xffffffffu, a2, base | u);
+      unsigned X3 = __shfl_sync(0xffffffffu, a3, base | u);
+      unsigned Y0 = __shfl_sync(0xffffffffu, b0, t + u);      // x of token 2q, k slice u (lanes 8q + u)
+      unsigned Y1 = __shfl_sync(0xffffffffu, b1, t + u);
+      unsigned Z0 = __shfl_sync(0xffffffffu, b0, t + 4 + u);  // token 2q + 1 (lanes 8q + 4 + u)
+      unsigned Z1 = __shfl_sync(0xffffffffu, b1, t + 4 + u);
+      c[0] = __dp4a((int)X0, (int)Y0, __dp4a((int)X2, (int)Y1, c[0]));
+      c[1] = __dp4a((int)X0, (int)Z0, __dp4a((int)X2, (int)Z1, c[1]));
+      c[2] = __dp4a((int)X1, (int)Y0, __dp4a((int)X3, (int)Y1, c[2]));
+      c[3] = __dp4a((int)X1, (int)Z0, __dp4a((int)X3, (int)Z1, c[3]));
+    }
+  }
+}
+template <bool DP>
+__device__ __forceinline__ void mma16t(int (&c)[4], unsigned a0, unsigned a1, unsigned b0) {
+  if constexpr (!DP) mma16(c, a0, a1, b0);
+  else {
+    const int lane = threadIdx.x & 31, q = lane & 3, base = lane & ~3, t = 8 * q;
+    int s[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      unsigned X0 = __shfl_sync(0xffffffffu, a0, base | u);
+      unsigned X1 = __shfl_sync(0xffffffffu, a1, base | u);
+      unsigned Y0 = __shfl_sync(0xffffffffu, b0, t + u);
+      unsigned Z0 = __shfl_sync(0xffffffffu, b0, t + 4 + u);
+      s[0] = __dp4a((int)X0, (int)Y0, s[0]);
+      s[1] = __dp4a((int)X0, (int)Z0, s[1]);
+      s[2] = __dp4a((int)X1, (int)Y0, s[2]);
+      s[3] = __dp4a((int)X1, (int)Z0, s[3]);
+    }
+    c[0] = s[0];
+    c[1] = s[1];
+    c[2] = s[2];
+    c[3] = s[3];  // mma16 resets its accumulator (see above)
+  }
+}
 
 // A warp's view of one call: B fragment token g (lane >> 2) as activation vector xv (-1 = none), and the C columns'
 // tokens 2q, 2q + 1 as vectors c0, c1 (their scales and sums). acc[m][i]: C element i (rows g, g, g+8, g+8 x tokens
@@ -134,8 +185,8 @@ __device__ __forceinline__ int2 load_s(const XQ &x, int k, int xb, int v) {
 }
 __device__ __forceinline__ int s64(int2 s, int h) { int v = h < 2 ? s.x : s.y; return (h & 1) ? (v >> 16) : (int)(short)v; }
 
-// Q2_0: x-block = 4 blocks
-template <int NM>
+// Q2_0: x-block = 4 blocks. DP: SM70 dp4a in place of the IMMA (mma32t above).
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_q2(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                         const Lane &L, float (&acc)[NM][4]) {
   const int nb = k >> 6, ng = k >> 8;
@@ -160,8 +211,8 @@ __device__ __forceinline__ void tile_q2(const uint8_t *const (&m)[NM], int rows,
       for (int b = 0; b < 4; b++) {
         unsigned A = (unsigned)comp4(wa[j], b), B = (unsigned)comp4(wb[j], b);
         int c[4] = {0, 0, 0, 0};
-        mma32(c, A & 0x03030303u, B & 0x03030303u, (A >> 2) & 0x03030303u, (B >> 2) & 0x03030303u, X[b].x, X[b].y);
-        mma32(c, (A >> 4) & 0x03030303u, (B >> 4) & 0x03030303u, (A >> 6) & 0x03030303u, (B >> 6) & 0x03030303u, X[b].z, X[b].w);
+        mma32t<DP>(c, A & 0x03030303u, B & 0x03030303u, (A >> 2) & 0x03030303u, (B >> 2) & 0x03030303u, X[b].x, X[b].y);
+        mma32t<DP>(c, (A >> 4) & 0x03030303u, (B >> 4) & 0x03030303u, (A >> 6) & 0x03030303u, (B >> 6) & 0x03030303u, X[b].z, X[b].w);
         float fa = h2f(b < 2 ? da[j].x : da[j].y, b & 1), fb = h2f(b < 2 ? db[j].x : db[j].y, b & 1);
         int t0 = s64(s0, b), t1 = s64(s1, b);
         p[0] += fa * (float)(c[0] - t0);
@@ -209,7 +260,7 @@ __device__ __forceinline__ void t1_groups(unsigned w, unsigned hw, unsigned tb, 
 }
 
 // PTQ1_0: x-block = 2 blocks
-template <int NM>
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_t1(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                         const Lane &L, float (&acc)[NM][4]) {
   const int nb = k >> 7, ng = k >> 8;
@@ -245,8 +296,8 @@ __device__ __forceinline__ void tile_t1(const uint8_t *const (&m)[NM], int rows,
 #pragma unroll
         for (int h = 0; h < 2; h++) {
           int4 xx = X[2 * b + h];
-          mma32(c, ga[4 * h], gb[4 * h], ga[4 * h + 1], gb[4 * h + 1], xx.x, xx.y);
-          mma32(c, ga[4 * h + 2], gb[4 * h + 2], ga[4 * h + 3], gb[4 * h + 3], xx.z, xx.w);
+          mma32t<DP>(c, ga[4 * h], gb[4 * h], ga[4 * h + 1], gb[4 * h + 1], xx.x, xx.y);
+          mma32t<DP>(c, ga[4 * h + 2], gb[4 * h + 2], ga[4 * h + 3], gb[4 * h + 3], xx.z, xx.w);
         }
         float fa = h2f(cwa, 1), fb = h2f(cwb, 1);
         int t0 = s64(s0, 2 * b) + s64(s0, 2 * b + 1), t1 = s64(s1, 2 * b) + s64(s1, 2 * b + 1);
@@ -273,7 +324,7 @@ __device__ __forceinline__ void q3_scales(const uint8_t *p, unsigned (&s)[4]) {
 }
 
 // Q3_K: x-block = 1 block, k16 mma per 16-weight sub-block (sub-block 4h + s), integer scale per sub-block
-template <int NM>
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_q3(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                         const Lane &L, float (&acc)[NM][4]) {
   const int nb = k >> 8;
@@ -309,7 +360,7 @@ __device__ __forceinline__ void tile_q3(const uint8_t *const (&m)[NM], int rows,
           unsigned qa = ((A >> (2 * s)) & 0x03030303u) | ((NA >> s) & 0x01010101u) * 0xfcu;
           unsigned qb = ((B >> (2 * s)) & 0x03030303u) | ((NB >> s) & 0x01010101u) * 0xfcu;
           int c[4];
-          mma16(c, qa, qb, comp4(X[h], s));
+          mma16t<DP>(c, qa, qb, comp4(X[h], s));
           int sub = 4 * h + s;
           int va = (int)((sa[sub >> 2] >> (8 * (sub & 3))) & 0xff) - 32, vb = (int)((sb[sub >> 2] >> (8 * (sub & 3))) & 0xff) - 32;
           is[0] += va * c[0];
@@ -327,7 +378,7 @@ __device__ __forceinline__ void tile_q3(const uint8_t *const (&m)[NM], int rows,
 }
 
 // Q8_0: x-block = 4 chunks of 2 blocks
-template <int NM>
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_q8(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                         const Lane &L, float (&acc)[NM][4]) {
   const int nu = k >> 6, ng = k >> 8;
@@ -348,8 +399,8 @@ __device__ __forceinline__ void tile_q8(const uint8_t *const (&m)[NM], int rows,
 #pragma unroll
         for (int hb = 0; hb < 2; hb++) {
           int c[4] = {0, 0, 0, 0};
-          if (hb == 0) mma32(c, A.x, B.x, A.y, B.y, X[h].x, X[h].y);
-          else mma32(c, A.z, B.z, A.w, B.w, X[h].z, X[h].w);
+          if (hb == 0) mma32t<DP>(c, A.x, B.x, A.y, B.y, X[h].x, X[h].y);
+          else mma32t<DP>(c, A.z, B.z, A.w, B.w, X[h].z, X[h].w);
           float fa = h2f((unsigned)comp4(da, h), hb), fb = h2f((unsigned)comp4(db, h), hb);
           p[0] += fa * (float)c[0];
           p[1] += fa * (float)c[1];
@@ -369,7 +420,7 @@ __device__ __forceinline__ void tile_q8(const uint8_t *const (&m)[NM], int rows,
 // 16 + 4q..+3: half q & 1 of codebook groups q >> 1 and 2 + (q >> 1). Grid halves and sign masks come from shared
 // tables; signs applied by (g ^ m) + (m & 1) per byte (one 32-bit add: magnitudes are <= 43, so no carries); integer scale 2 ls + 1 per half, d / 8 per block.
 // Every thread of the block must call this (the tables are filled with a __syncthreads).
-template <int NM>
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_iq2(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                          const Lane &L, float (&acc)[NM][4], bool fill) {
   unsigned *G32 = iq_tab, *S32 = iq_tab + 512;
@@ -406,7 +457,7 @@ __device__ __forceinline__ void tile_iq2(const uint8_t *const (&m)[NM], int rows
             return (w ^ mk) + (mk & 0x01010101u);  // -g where mk = 0xff: ~g + 1, no carries (g <= 43)
           };
           int c[4] = {0, 0, 0, 0};
-          mma32(c, dec(ga, sa, l0), dec(gb, sb, l0), dec(ga, sa, l1), dec(gb, sb, l1), e ? X[h].z : X[h].x, e ? X[h].w : X[h].y);
+          mma32t<DP>(c, dec(ga, sa, l0), dec(gb, sb, l0), dec(ga, sa, l1), dec(gb, sb, l1), e ? X[h].z : X[h].x, e ? X[h].w : X[h].y);
           int la = 2 * (int)(sa >> 28) + 1, lb = 2 * (int)(sb >> 28) + 1;
           is[0] += la * c[0];
           is[1] += la * c[1];
@@ -425,7 +476,7 @@ __device__ __forceinline__ void tile_iq2(const uint8_t *const (&m)[NM], int rows
 // IQ1_S: x-block = 1 block, one k32 mma per 32-block. A weight is d (2s + 1) (g + delta), g in {-1, 0, 1}, delta =
 // +-1/8: the A bytes are 8 g + 8 delta (exact int8, -9..9): 8 g (bytes -8 / 0 / 8) from the grid, plus or minus 1
 // per byte (the -1 case biased by 0x80 so no byte borrows); integer scale 2 s + 1 per 32-block, d / 8 per block.
-template <int NM>
+template <int NM, bool DP>
 __device__ __forceinline__ void tile_iq1s(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                           const Lane &L, float (&acc)[NM][4]) {
   const int nb = k >> 8;
@@ -460,8 +511,8 @@ __device__ __forceinline__ void tile_iq1s(const uint8_t *const (&m)[NM], int row
           return ((n << 3) + ((qh & 0x8000) ? 0x77777777u : 0x79797979u)) ^ 0x80808080u;
         };
         int c[4] = {0, 0, 0, 0};
-        mma32(c, dec(qa, ha, l0), dec(qb, hb, l0), dec(qa, ha, l1), dec(qb, hb, l1), (ib & 1) ? X[ib >> 1].z : X[ib >> 1].x,
-              (ib & 1) ? X[ib >> 1].w : X[ib >> 1].y);
+        mma32t<DP>(c, dec(qa, ha, l0), dec(qb, hb, l0), dec(qa, ha, l1), dec(qb, hb, l1), (ib & 1) ? X[ib >> 1].z : X[ib >> 1].x,
+                   (ib & 1) ? X[ib >> 1].w : X[ib >> 1].y);
         int la = 2 * (int)((ha >> 12) & 7) + 1, lb = 2 * (int)((hb >> 12) & 7) + 1;
         is[0] += la * c[0];
         is[1] += la * c[1];
@@ -480,7 +531,7 @@ __device__ __forceinline__ void tile_iq1s(const uint8_t *const (&m)[NM], int row
 // 2s, 2s + 1; lane q's bytes are group 2s + (q >> 1), half q & 1). Magnitudes 8 / 25 / 43 from a shared grid table,
 // signs by (g ^ m) + (m & 1); integer scale 2 sc + 1 per 16, d / 8 per block. IQ2_XS: 9-bit grid index and 7-bit
 // parity sign index per group (u16); IQ2_S: 10-bit grid index (qs byte + 2 qh bits) and a full sign byte.
-template <int NM, bool S>
+template <int NM, bool DP, bool S>
 __device__ __forceinline__ void tile_iq2xs(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb, const XQ &x,
                                            const Lane &L, float (&acc)[NM][4], bool fill) {
   constexpr int NG = S ? 1024 : 512;
@@ -543,7 +594,7 @@ __device__ __forceinline__ void tile_iq2xs(const uint8_t *const (&m)[NM], int ro
             return (w ^ mk) + (mk & 0x01010101u);
           };
           int c[4];
-          mma16(c, dec(A, EA), dec(B, EB), comp4(X[ib >> 1], 2 * (ib & 1) + sub));
+          mma16t<DP>(c, dec(A, EA), dec(B, EB), comp4(X[ib >> 1], 2 * (ib & 1) + sub));
           int la = 2 * (int)((sca >> (4 * sub)) & 15) + 1, lb = 2 * (int)((scb >> (4 * sub)) & 15) + 1;
           is[0] += la * c[0];
           is[1] += la * c[1];
@@ -559,17 +610,17 @@ __device__ __forceinline__ void tile_iq2xs(const uint8_t *const (&m)[NM], int ro
   }
 }
 
-template <int NM>
+template <int NM, bool DP = false>
 __device__ __forceinline__ void tile_dot(int ty, const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb,
                                          const XQ &x, const Lane &L, float (&acc)[NM][4], bool fill = true) {
-  if (ty == RP_Q2) tile_q2<NM>(m, rows, k, ra, rb, x, L, acc);
-  else if (ty == RP_T1) tile_t1<NM>(m, rows, k, ra, rb, x, L, acc);
-  else if (ty == RP_Q3) tile_q3<NM>(m, rows, k, ra, rb, x, L, acc);
-  else if (ty == RP_Q8) tile_q8<NM>(m, rows, k, ra, rb, x, L, acc);
-  else if (ty == RP_IQ2) tile_iq2<NM>(m, rows, k, ra, rb, x, L, acc, fill);
-  else if (ty == RP_IQ1S) tile_iq1s<NM>(m, rows, k, ra, rb, x, L, acc);
-  else if (ty == RP_IQ2XS) tile_iq2xs<NM, false>(m, rows, k, ra, rb, x, L, acc, fill);
-  else if (ty == RP_IQ2S) tile_iq2xs<NM, true>(m, rows, k, ra, rb, x, L, acc, fill);
+  if (ty == RP_Q2) tile_q2<NM, DP>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_T1) tile_t1<NM, DP>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_Q3) tile_q3<NM, DP>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_Q8) tile_q8<NM, DP>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_IQ2) tile_iq2<NM, DP>(m, rows, k, ra, rb, x, L, acc, fill);
+  else if (ty == RP_IQ1S) tile_iq1s<NM, DP>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_IQ2XS) tile_iq2xs<NM, DP, false>(m, rows, k, ra, rb, x, L, acc, fill);
+  else if (ty == RP_IQ2S) tile_iq2xs<NM, DP, true>(m, rows, k, ra, rb, x, L, acc, fill);
 }
 
 // ---------------------------------------------------------------- activations
@@ -663,10 +714,10 @@ __device__ __forceinline__ bool ks_sum(float (&acc)[NM][4]) {
 }
 
 // y [T][rows] = W x [T][k] for a repacked matrix (type ty), x from quant_act. grid ceil(rows / 16), block 32 * KS.
-// SM70: stub (IMMA needs sm_75+); the Volta dp4a port lands in a later task.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_t *w, int rows, int k, int T,
-                                                            const int8_t *xq, const float *xd, const short *xs, float *y) {
+// SM70 (DP = true): the IMMA tiles run as dp4a (mma32t/mma16t above); same fragments, same integer products.
+template <bool DP>
+__device__ __forceinline__ void xgemv_k(int ty, const uint8_t *w, int rows, int k, int T, const int8_t *xq, const float *xd,
+                                        const short *xs, float *y) {
   int lane = threadIdx.x & 31, g = lane >> 2;
   Lane L{lane & 3, g < T ? g : -1, 2 * (lane & 3) < T ? 2 * (lane & 3) : -1, 2 * (lane & 3) + 1 < T ? 2 * (lane & 3) + 1 : -1, (int)threadIdx.x >> 5};
   const uint8_t *m[1] = {w};
@@ -675,7 +726,7 @@ extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_
     if (r0 >= rows) break;
     int ra = min(r0 + g, rows - 1), rb = min(r0 + g + 8, rows - 1);
     float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
-    tile_dot<1>(ty, m, rows, k, ra, rb, XQ{xq, xd, xs}, L, acc, tt == 0);
+    tile_dot<1, DP>(ty, m, rows, k, ra, rb, XQ{xq, xd, xs}, L, acc, tt == 0);
     if (ks_sum<1>(acc))
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -685,10 +736,15 @@ extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_
     if (ROWT > 1) __syncthreads();  // ks_sum's shared sums are rewritten by the next tile
   }
 }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_t *w, int rows, int k, int T,
+                                                            const int8_t *xq, const float *xd, const short *xs, float *y) {
+  xgemv_k<false>(ty, w, rows, k, T, xq, xd, xs, y);
+}
 #else
 extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_t *w, int rows, int k, int T,
                                                             const int8_t *xq, const float *xd, const short *xs, float *y) {
-  // SM70 stub: writes nothing
+  xgemv_k<true>(ty, w, rows, k, T, xq, xd, xs, y);  // SM70: dp4a
 }
 #endif
 
@@ -696,12 +752,11 @@ extern "C" __global__ void __launch_bounds__(32 * KS) xgemv(int ty, const uint8_
 // h [T][K][inter] = bf16(silu(min(gate x_t, lim)) * clamp(up x_t, -lim, lim) * w) for every (token, pick) whose expert
 // is resident; one y-block per plan entry, so an expert picked by several tokens is read once.
 // x: quant_act of x [T][dim] (which also wrote plan). grid (ceil(inter / 16), T * K), block 32 * KS.
-// SM70: stub, like xgemv above.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot *tab, int layer, int E, const int *plan,
-                                                             const float *wts, int K, const uint8_t *store,
-                                                             const int8_t *xq, const float *xd, const short *xs,
-                                                             float *h, int inter, int dim, float lim) {
+// SM70 (DP = true): as xgemv above.
+template <bool DP>
+__device__ __forceinline__ void moe_gu_fast_k(const ExpSlot *tab, int layer, int E, const int *plan, const float *wts, int K,
+                                              const uint8_t *store, const int8_t *xq, const float *xd, const short *xs,
+                                              float *h, int inter, int dim, float lim) {
   if ((int)blockIdx.y >= plan[0]) return;
   const int *ent = plan + 1 + blockIdx.y * PLAN_W;
   int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
@@ -713,7 +768,7 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot 
     int r0 = (blockIdx.x * ROWT + tt) * 16;
     if (r0 >= inter) break;
     float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
-    tile_dot<2>(s.gu, m, inter, dim, min(r0 + g, inter - 1), min(r0 + g + 8, inter - 1), XQ{xq, xd, xs}, L, acc, tt == 0);
+    tile_dot<2, DP>(s.gu, m, inter, dim, min(r0 + g, inter - 1), min(r0 + g + 8, inter - 1), XQ{xq, xd, xs}, L, acc, tt == 0);
     if (ks_sum<2>(acc))
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -726,12 +781,19 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot 
     if (ROWT > 1) __syncthreads();
   }
 }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot *tab, int layer, int E, const int *plan,
+                                                             const float *wts, int K, const uint8_t *store,
+                                                             const int8_t *xq, const float *xd, const short *xs,
+                                                             float *h, int inter, int dim, float lim) {
+  moe_gu_fast_k<false>(tab, layer, E, plan, wts, K, store, xq, xd, xs, h, inter, dim, lim);
+}
 #else
 extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot *tab, int layer, int E, const int *plan,
                                                              const float *wts, int K, const uint8_t *store,
                                                              const int8_t *xq, const float *xd, const short *xs,
                                                              float *h, int inter, int dim, float lim) {
-  // SM70 stub: writes nothing
+  moe_gu_fast_k<true>(tab, layer, E, plan, wts, K, store, xq, xd, xs, h, inter, dim, lim);  // SM70: dp4a
 }
 #endif
 
@@ -739,12 +801,11 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_gu_fast(const ExpSlot 
 // One y-block per plan entry writes its partial sums (part [64][8][dim]); the last block of a row tile to finish adds
 // them in entry order (deterministic) into out. cnt [ceil(dim / 16)] zeroed once, reset by the last block.
 // grid (ceil(dim / 16), T * K), block 32 * KS.
-// SM70: stub, like xgemv above.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlot *tab, int layer, int E, const int *plan,
-                                                               int K, const uint8_t *store, const int8_t *hq,
-                                                               const float *hd, const short *hs, float *out, int inter,
-                                                               int dim, int T, float *part, int *cnt) {
+// SM70 (DP = true): as xgemv above.
+template <bool DP>
+__device__ __forceinline__ void moe_down_fast_k(const ExpSlot *tab, int layer, int E, const int *plan, int K,
+                                                const uint8_t *store, const int8_t *hq, const float *hd, const short *hs,
+                                                float *out, int inter, int dim, int T, float *part, int *cnt) {
   __shared__ int last;
   int n = plan[0], u = blockIdx.y;
   int lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
@@ -765,7 +826,7 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlo
       ExpSlot s = tab[layer * E + ent[0]];
       const uint8_t *m[1] = {store + s.down};
       float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
-      tile_dot<1>(s.dn, m, dim, inter, min(rt + g, dim - 1), min(rt + g + 8, dim - 1), XQ{hq, hd, hs}, L, acc, tt == 0);
+      tile_dot<1, DP>(s.dn, m, dim, inter, min(rt + g, dim - 1), min(rt + g + 8, dim - 1), XQ{hq, hd, hs}, L, acc, tt == 0);
       if (ks_sum<1>(acc))
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -791,12 +852,19 @@ extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlo
     if (ROWT > 1) __syncthreads();  // `last` and ks_sum's shared sums are rewritten by the next tile
   }
 }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlot *tab, int layer, int E, const int *plan,
+                                                               int K, const uint8_t *store, const int8_t *hq,
+                                                               const float *hd, const short *hs, float *out, int inter,
+                                                               int dim, int T, float *part, int *cnt) {
+  moe_down_fast_k<false>(tab, layer, E, plan, K, store, hq, hd, hs, out, inter, dim, T, part, cnt);
+}
 #else
 extern "C" __global__ void __launch_bounds__(32 * KS) moe_down_fast(const ExpSlot *tab, int layer, int E, const int *plan,
                                                                int K, const uint8_t *store, const int8_t *hq,
                                                                const float *hd, const short *hs, float *out, int inter,
                                                                int dim, int T, float *part, int *cnt) {
-  // SM70 stub: writes nothing
+  moe_down_fast_k<true>(tab, layer, E, plan, K, store, hq, hd, hs, out, inter, dim, T, part, cnt);  // SM70: dp4a
 }
 #endif
 
