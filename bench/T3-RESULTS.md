@@ -36,6 +36,10 @@ The integer dp4a accumulators are identical (the layout mixup the task warns abo
 ~1.0 rel error); the residual few-1e-7 is float affine/FMA ordering plus one group scale differing in its last
 mantissa bit (Hadamard tree order), which flipped no int8 code. Max rel diff overall: **3.83e-7**.
 
+Post-review hardening re-run (every GPU download gated on all-finite, per prefill-bench's convention; identical
+seed, so identical numbers): part 2.874e-7 / 3.832e-7 / 3.832e-7 / h 0.0, full-chain down 0.0, out 4.873e-7,
+`h_bits_mismatch` 0 — PASS.
+
 ## Throughput (`t16-decode-probe`, EXEC:VM) — PASS
 
 One synthetic decode expert step: T=8 tokens, K=6 picks (48 distinct experts of E=384 resident), dim=7168,

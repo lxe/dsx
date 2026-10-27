@@ -10,6 +10,7 @@
 //! parts, so those gates are 1e-2 and the part-level checks carry the correctness.
 use anyhow::{Result, ensure};
 use dsx::cpu::t16k::{self, Act};
+use dsx::experts::{T16_SD, T16_SGU};
 use dsx::gpu::{Arg, Buf, Gpu, Kernel};
 use dsx::t16;
 use half::f16;
@@ -117,6 +118,7 @@ fn scratch(g: &Gpu, picks: usize, dim: usize, inter: usize, sgu: usize, sd: usiz
 
 /// the t16d_* launch sequence of run_t16_on (experts.rs), one layer's picks: prep gate/up, the two GEMVs, post_gu;
 /// `down` adds prep h, the down GEMV and post_down. `gemv` is the t16d_gemv kernel for the layer's k2.
+/// MUST mirror `run_t16_on` (experts.rs): launch order, grid shapes, arg lists. Update when that changes.
 #[allow(clippy::too_many_arguments)]
 fn chain(
     g: &Gpu,
@@ -268,26 +270,31 @@ fn main() -> Result<()> {
         t16k::gemv(&mg, k2, dim, inter, &ag, 0, inter / 16, &mut yg);
         t16k::gemv(&mu, k2, dim, inter, &au, 0, inter / 16, &mut yu);
 
-        // GPU: the engine's split count for gate/up (S=4) end to end, and S=1 for a directly comparable part
+        // GPU: the engine's split count for gate/up (T16_SGU) end to end, and S=1 for a directly comparable part
         let s1 = scratch(&g, 1, dim, inter, 1, 1)?;
         chain(&g, kernels["t16d_prep"], kernels["t16d_gemv_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], false, sel.ptr, wts.ptr, tab.ptr, base.ptr, xd.ptr, 0, 0, 1, 1, 1, dim, inter, k2, k2, 1, 1, lim, &s1)?;
         let part1: Vec<f32> = g.download(s1.pg.ptr, inter)?;
+        ensure!(part1.iter().all(|v| v.is_finite()), "nonfinite GPU output (part, S=1)");
         // the same with the plain (SM70-selected) kernel: same output bits
         let s1b = scratch(&g, 1, dim, inter, 1, 1)?;
         chain(&g, kernels["t16d_prep"], kernels["t16d_gemv0_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], false, sel.ptr, wts.ptr, tab.ptr, base.ptr, xd.ptr, 0, 0, 1, 1, 1, dim, inter, k2, k2, 1, 1, lim, &s1b)?;
         let part1b: Vec<f32> = g.download(s1b.pg.ptr, inter)?;
+        ensure!(part1b.iter().all(|v| v.is_finite()), "nonfinite GPU output (part, gemv0)");
         let gemv0_bits_eq = part1.iter().zip(&part1b).all(|(a, b)| a.to_bits() == b.to_bits());
         ensure!(gemv0_bits_eq, "t16d_gemv_4 and t16d_gemv0_4 outputs differ (SM70 runs the same body)");
 
-        let s4 = scratch(&g, 1, dim, inter, 4, 1)?;
-        chain(&g, kernels["t16d_prep"], kernels["t16d_gemv_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], false, sel.ptr, wts.ptr, tab.ptr, base.ptr, xd.ptr, 0, 0, 1, 1, 1, dim, inter, k2, k2, 4, 1, lim, &s4)?;
-        let part4: Vec<f32> = g.download(s4.pg.ptr, 4 * inter)?;
-        let sum: Vec<f32> = (0..inter).map(|i| (0..4).map(|q| part4[q * inter + i]).sum()).collect();
+        let s4 = scratch(&g, 1, dim, inter, T16_SGU, 1)?;
+        chain(&g, kernels["t16d_prep"], kernels["t16d_gemv_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], false, sel.ptr, wts.ptr, tab.ptr, base.ptr, xd.ptr, 0, 0, 1, 1, 1, dim, inter, k2, k2, T16_SGU, 1, lim, &s4)?;
+        let part4: Vec<f32> = g.download(s4.pg.ptr, T16_SGU * inter)?;
+        ensure!(part4.iter().all(|v| v.is_finite()), "nonfinite GPU output (part, S=T16_SGU)");
+        let sum: Vec<f32> = (0..inter).map(|i| (0..T16_SGU).map(|q| part4[q * inter + i]).sum()).collect();
         let h_gpu: Vec<f32> = g.download(s4.h.ptr, inter)?;
+        ensure!(h_gpu.iter().all(|v| v.is_finite()), "nonfinite GPU output (post_gu h)");
 
         // the GPU's own activations: same int8 codes / scales as the CPU prep?
         let xp: Vec<u32> = g.download(s4.xpg.ptr, dim / 2)?;
         let xdv: Vec<f32> = g.download(s4.xdg.ptr, dim / 256)?;
+        ensure!(xdv.iter().all(|v| v.is_finite()), "nonfinite GPU output (prep group scales)");
         let xsv: Vec<i32> = g.download(s4.xsg.ptr, dim / 256)?;
         let codes_differ = xp.iter().zip(&ag.x4).filter(|(a, b)| **a as i32 != **b).count();
         let scale_bits_differ = xdv.iter().zip(&ag.d).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
@@ -353,12 +360,15 @@ fn main() -> Result<()> {
             t16k::post_block(&mut out_cpu[o..], svh_d, o);
         }
 
-        // GPU: the engine's chain, engine split counts (gate/up S=4, down S=3)
-        let scr = scratch(&g, 1, dim, inter, 4, 3)?;
-        chain(&g, kernels["t16d_prep"], kernels["t16d_gemv_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], true, sel.ptr, wts.ptr, tab.ptr, base.ptr, xb.ptr, out.ptr, 0, 1, 1, 1, dim, inter, k2, k2, 4, 3, lim, &scr)?;
+        // GPU: the engine's chain, engine split counts (gate/up T16_SGU, down T16_SD)
+        let scr = scratch(&g, 1, dim, inter, T16_SGU, T16_SD)?;
+        chain(&g, kernels["t16d_prep"], kernels["t16d_gemv_4"], kernels["t16d_post_gu"], kernels["t16d_post_down"], true, sel.ptr, wts.ptr, tab.ptr, base.ptr, xb.ptr, out.ptr, 0, 1, 1, 1, dim, inter, k2, k2, T16_SGU, T16_SD, lim, &scr)?;
         let out_gpu: Vec<f32> = g.download(out.ptr, dim)?;
+        ensure!(out_gpu.iter().all(|v| v.is_finite()), "nonfinite GPU output (full-chain out)");
         let h_gpu: Vec<f32> = g.download(scr.h.ptr, inter)?;
-        let h_bits_eq = h_gpu.iter().zip(&h_cpu).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        ensure!(h_gpu.iter().all(|v| v.is_finite()), "nonfinite GPU output (full-chain h)");
+        // count of h entries whose bits differ from the CPU's (informational; the rel gates carry the check)
+        let h_bits_mismatch = h_gpu.iter().zip(&h_cpu).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
 
         // the down GEMV in isolation: the GPU prep/gemv on the CPU's h (part-level, 1e-6)
         let hb = g.upload(&h_cpu)?;
@@ -378,6 +388,7 @@ fn main() -> Result<()> {
             &[Arg::P(scr.xpd.ptr), Arg::P(scr.xdd.ptr), Arg::P(scr.xsd.ptr), Arg::P(sel.ptr), Arg::P(tab.ptr), Arg::P(base.ptr), Arg::I(0), Arg::I(1), Arg::I(1), Arg::I(1), Arg::I(2), Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(1), Arg::P(pd1.ptr)],
         )?;
         let down1: Vec<f32> = g.download(pd1.ptr, dim)?;
+        ensure!(down1.iter().all(|v| v.is_finite()), "nonfinite GPU output (down part)");
         let mut down_cpu = vec![0f32; dim];
         t16k::gemv(&md, k2, inter, dim, &ad, 0, dim / 16, &mut down_cpu);
         let r_down = rel(&down_cpu, &down1);
@@ -385,8 +396,8 @@ fn main() -> Result<()> {
         let pass = r_down < 1e-6 && r_out < 1e-2;
         println!(
             "{}",
-            json!({"test":"full-chain","k2":k2,"dim":dim,"inter":inter,"T":1,"K":1,"sgu":4,"sd":3,
-                   "maxrel_down_part":r_down,"maxrel_out":r_out,"h_bits_differ":h_bits_eq,
+            json!({"test":"full-chain","k2":k2,"dim":dim,"inter":inter,"T":1,"K":1,"sgu":T16_SGU,"sd":T16_SD,
+                   "maxrel_down_part":r_down,"maxrel_out":r_out,"h_bits_mismatch":h_bits_mismatch,
                    "gate_down":1e-6,"gate_out":1e-2,"pass":pass,
                    "cpu_out_first16":out_cpu[..16],"gpu_out_first16":out_gpu[..16]})
         );

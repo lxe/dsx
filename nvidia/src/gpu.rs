@@ -120,9 +120,11 @@ impl Gpu {
         Ok(n)
     }
 
-    /// the device is SM 7.0 (Volta; no cp.async): guarded-off kernels take their plain fallback, chosen at run time
+    /// the device is pre-SM80 (SM 7.x: Volta has no cp.async; SM75 is intentionally covered by the same pre-SM80
+    /// guards — a multi-arch fatbin JIT'd onto SM75 must also pick the plain gemv): guarded-off kernels take their
+    /// plain fallback, chosen at run time
     pub fn is_sm70(&self) -> bool {
-        self.arch == 70
+        self.arch < 800
     }
 
     /// host -> device bandwidth from pinned memory in GB/s (best of 3 copies of `stage`), which tells the link

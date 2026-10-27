@@ -1,11 +1,12 @@
 //! T3 throughput probe: one synthetic decode expert step (T=8 tokens x K=6 picks from E=384 resident experts,
 //! dim=7168, inter=2048, T16 K2=4) through the full t16d_* chain on one GPU, launched exactly as the engine's
-//! run_t16_on (experts.rs) launches it (gate/up GEMV k-splits S=14 as specced; down S=3, the engine's T16_SD).
-//! Gate: <= 90 ms per expert step on one V100. Calibration: Phase-0's K1 micro-benchmark ran the raw GEMV kernel
-//! at 207.8 GB/s weight-stream (17.66 us per k=7168 x n=2048 matrix), so the 48 picks' 144 matrix reads
-//! (~0.53 GB of trellis) are ~2.5 ms of streaming -- anything near 90 ms is overhead, not math.
+//! run_t16_on (experts.rs) launches it (gate/up GEMV k-splits S=14 as specced for this shape; down S = the
+//! engine's T16_SD). Gate: <= 90 ms per expert step on one V100. Calibration: Phase-0's K1 micro-benchmark ran
+//! the raw GEMV kernel at 207.8 GB/s weight-stream (17.66 us per k=7168 x n=2048 matrix), so the 48 picks' 144
+//! matrix reads (~0.53 GB of trellis) are ~2.5 ms of streaming -- anything near 90 ms is overhead, not math.
 //! The store is zero-filled: the kernels have no value-dependent branches, so timing is data-independent.
-use anyhow::Result;
+use anyhow::{Result, ensure};
+use dsx::experts::T16_SD;
 use dsx::gpu::{Arg, Buf, Gpu, Kernel};
 use dsx::t16;
 use serde_json::json;
@@ -56,7 +57,8 @@ fn scratch(g: &Gpu, picks: usize, dim: usize, inter: usize, sgu: usize, sd: usiz
 
 /// the run_t16_on (experts.rs) launch sequence for one layer's expert step; `phase` selects a subset for the
 /// breakdown: 0 = all eight launches, 1 = the two preps + two GEMVs + post_gu, 2 = the three GEMVs only,
-/// 3 = the three preps only, 4 = the two posts only
+/// 3 = the three preps only, 4 = the two posts only.
+/// MUST mirror `run_t16_on` (experts.rs): launch order, grid shapes, arg lists. Update when that changes.
 #[allow(clippy::too_many_arguments)]
 fn chain(
     g: &Gpu,
@@ -163,7 +165,7 @@ fn timed(mut f: impl FnMut() -> Result<()>, g: &Gpu) -> Result<f64> {
 }
 
 fn main() -> Result<()> {
-    let (t, k, e, dim, inter, k2, sgu, sd, lim) = (8usize, 6usize, 384usize, 7168usize, 2048usize, 4usize, 14usize, 3usize, 40.0f32);
+    let (t, k, e, dim, inter, k2, sgu, sd, lim) = (8usize, 6usize, 384usize, 7168usize, 2048usize, 4usize, 14usize, T16_SD, 40.0f32);
     let g = Gpu::new(0)?;
     let kernels: HashMap<&str, Kernel> = ["t16d_prep", "t16d_gemv_4", "t16d_gemv0_4", "t16d_post_gu", "t16d_post_down"]
         .into_iter()
@@ -218,5 +220,6 @@ fn main() -> Result<()> {
     let final_out: Vec<f32> = g.download(out.ptr, t * dim)?;
     let nonfinite = final_out.iter().filter(|v| !v.is_finite()).count();
     println!("{}", json!({"test":"sanity","out_nonfinite":nonfinite,"out_first8":final_out[..8]}));
+    ensure!(nonfinite == 0, "nonfinite probe output");
     Ok(())
 }

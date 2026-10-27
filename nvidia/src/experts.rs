@@ -230,9 +230,10 @@ impl T16Bufs {
     }
 }
 
-/// k-splits of the T16 GEMVs: gate / up (dim / 256 = 20 groups), down (inter / 256 = 9 groups)
-const T16_SGU: usize = 4;
-const T16_SD: usize = 3;
+/// k-splits of the T16 GEMVs: gate / up (dim / 256 = 20 groups), down (inter / 256 = 9 groups); the decode-path
+/// harnesses (src/bin/t16-decode-*.rs) link these so their launches cannot drift from the engine's split counts
+pub const T16_SGU: usize = 4;
+pub const T16_SD: usize = 3;
 
 /// Type id of `t` repacked for the fast kernels (expert_fast.cuh), the same bytes per weight.
 pub fn repacked_id(t: GType) -> Result<i32> {
