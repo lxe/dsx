@@ -172,7 +172,7 @@ fn main() -> Result<()> {
         .map(|n| Ok((n, g.kernel(n)?)))
         .collect::<Result<_>>()?;
     let (free, total) = g.mem_info()?;
-    println!("{}", json!({"test":"env","gpu":g.name.clone(),"arch":g.arch,"sm70":g.is_sm70(),"sms":g.sms,"free_mib":free >> 20,"total_mib":total >> 20}));
+    println!("{}", json!({"test":"env","gpu":g.name.clone(),"arch":g.arch,"pre_sm80":g.is_pre_sm80(),"sms":g.sms,"free_mib":free >> 20,"total_mib":total >> 20}));
 
     // the synthetic store: E resident experts, gate | up [inter][dim] and down [dim][inter] per expert, all T16 K2
     let mb = t16::trellis_bytes(k2, dim, inter) + 2 * dim + 2 * inter; // = matrix_bytes(ty, dim, inter)
