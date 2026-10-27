@@ -9,3 +9,8 @@ Gerganov and the ggml authors (MIT), vendored in [`core/webui`](core/webui) with
 
 
 MIT license; vendored and derived components retain their own license notices.
+
+Native Q2_K and IQ3_XXS layouts, codebook tables and reference fixtures follow
+[ggml](https://github.com/ggml-org/llama.cpp/tree/da8e2a54b919557b816b1c2beb432ccb766f7ce0/ggml)
+(MIT); the table files retain the ggml license notice. Fixture regeneration is documented in
+[`docs/native-quant.md`](docs/native-quant.md).

@@ -236,7 +236,7 @@ const T16_SD: usize = 3;
 
 /// Type id of `t` repacked for the fast kernels (expert_fast.cuh), the same bytes per weight.
 pub fn repacked_id(t: GType) -> Result<i32> {
-    if !matches!(t, GType::Iq2Xxs | GType::Iq1S | GType::Iq2Xs | GType::Iq2S) && !is_t16(t) {
+    if !matches!(t, GType::Iq2Xxs | GType::Iq1S | GType::Iq2Xs | GType::Iq2S | GType::Q2K | GType::Iq3Xxs) && !is_t16(t) {
         gemv_name(t)?; // IQ2_XXS has only the fast (repacked) kernels
     }
     Ok(2000 + t as u32 as i32)
@@ -304,6 +304,7 @@ impl GpuExperts {
                 Ok(p)
             };
             for t in [x.gu, x.dn] {
+                anyhow::ensure!(fast || !matches!(t, GType::Q2K | GType::Iq3Xxs), "Q2_K / IQ3_XXS experts require the fast store (unset DSX_OLD_MOE)");
                 // a kernel exists for the layout; raw IQ stores (DSX_OLD_MOE) only have prefill's dequant_f16 so far
                 if is_t16(t) {
                     anyhow::ensure!(fast, "T16 experts need the fast store (unset DSX_OLD_MOE)");

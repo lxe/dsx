@@ -30,6 +30,9 @@
 //   (the GGUF block bytes, d split out so each block's codes start 16-byte aligned)
 #pragma once
 #include "iq2grid.cuh"
+#include "native_quant.cuh"
+#define RP_Q2K 2010
+#define RP_IQ3XXS 2018
 
 #define RP_Q8 2008
 #define RP_Q2 2042
@@ -545,10 +548,66 @@ __device__ __forceinline__ void tile_iq2xs(const uint8_t *const (&m)[NM], int ro
   }
 }
 
+// Q2_K / IQ3_XXS retain their original 84 / 98-byte blocks. The initial implementation favors
+// auditable layouts: integer fragments are expanded in registers, not staged as float matrices.
+template <bool IQ3, int NM>
+__device__ __forceinline__ void tile_native(const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb,
+                                           const XQ &x, const Lane &L, float (&acc)[NM][4]) {
+  const int nb = k / 256, bs = IQ3 ? 98 : 84;
+  for (int xb = L.k0; xb < nb; xb += KS) {
+    int4 X[4]; float dx0, dx1;
+    load_x(x, k, xb, L, X, dx0, dx1);
+    for (int j = 0; j < NM; j++) {
+      const uint8_t *pa = m[j] + ((size_t)ra * nb + xb) * bs;
+      const uint8_t *pb = m[j] + ((size_t)rb * nb + xb) * bs;
+      int sum[4] = {0,0,0,0}, sub[4] = {0,0,0,0};
+      for (int g = 0; g < 8; g++) {
+        unsigned sa = IQ3 ? native_u32(pa + 66 + 4*g) : 0;
+        unsigned sb = IQ3 ? native_u32(pb + 66 + 4*g) : 0;
+        auto quad = [&](const uint8_t *p, unsigned sg, int q, bool minimum) -> unsigned {
+          if (IQ3) {
+            unsigned v = iq3xxs_grid[p[2 + g*8 + q]];
+            unsigned si = ksigns_iq2xs[(sg >> (7*(q/2))) & 127] >> (4*(q%2));
+            unsigned out = 0;
+            for (int i=0; i<4; i++) {
+              int z = (v >> (8*i)) & 255;
+              if ((si >> i) & 1) z = -z;
+              out |= (unsigned)(uint8_t)z << (8*i);
+            }
+            return out;
+          } else {
+            unsigned sc = p[2*g + q/4], out = 0;
+            for (int i=0; i<4; i++) {
+              unsigned v = minimum ? sc >> 4 : ((p[16 + (g/4)*32 + 4*q+i] >> (2*(g%4))) & 3) * (sc & 15);
+              out |= v << (8*i);
+            }
+            return out;
+          }
+        };
+        int c[4] = {0,0,0,0};
+        int b0 = (g&1) ? X[g/2].z : X[g/2].x, b1 = (g&1) ? X[g/2].w : X[g/2].y;
+        mma32(c, quad(pa,sa,L.q,false), quad(pb,sb,L.q,false), quad(pa,sa,L.q+4,false), quad(pb,sb,L.q+4,false), b0,b1);
+        int la = IQ3 ? 2*(int)(sa>>28)+1 : 1, lb = IQ3 ? 2*(int)(sb>>28)+1 : 1;
+        sum[0] += la*c[0]; sum[1] += la*c[1]; sum[2] += lb*c[2]; sum[3] += lb*c[3];
+        if (!IQ3) mma32(sub, quad(pa,0,L.q,true), quad(pb,0,L.q,true), quad(pa,0,L.q+4,true), quad(pb,0,L.q+4,true), b0,b1);
+      }
+      float da = ld_h(pa + (IQ3 ? 0 : 80)) * (IQ3 ? 0.25f : 1.f);
+      float db = ld_h(pb + (IQ3 ? 0 : 80)) * (IQ3 ? 0.25f : 1.f);
+      float ma = IQ3 ? 0.f : ld_h(pa+82), mb = IQ3 ? 0.f : ld_h(pb+82);
+      acc[j][0] += dx0 * (da*(float)sum[0] - ma*(float)sub[0]);
+      acc[j][1] += dx1 * (da*(float)sum[1] - ma*(float)sub[1]);
+      acc[j][2] += dx0 * (db*(float)sum[2] - mb*(float)sub[2]);
+      acc[j][3] += dx1 * (db*(float)sum[3] - mb*(float)sub[3]);
+    }
+  }
+}
+
 template <int NM>
 __device__ __forceinline__ void tile_dot(int ty, const uint8_t *const (&m)[NM], int rows, int k, int ra, int rb,
                                          const XQ &x, const Lane &L, float (&acc)[NM][4], bool fill = true) {
-  if (ty == RP_Q2) tile_q2<NM>(m, rows, k, ra, rb, x, L, acc);
+  if (ty == RP_Q2K) tile_native<false, NM>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_IQ3XXS) tile_native<true, NM>(m, rows, k, ra, rb, x, L, acc);
+  else if (ty == RP_Q2) tile_q2<NM>(m, rows, k, ra, rb, x, L, acc);
   else if (ty == RP_T1) tile_t1<NM>(m, rows, k, ra, rb, x, L, acc);
   else if (ty == RP_Q3) tile_q3<NM>(m, rows, k, ra, rb, x, L, acc);
   else if (ty == RP_Q8) tile_q8<NM>(m, rows, k, ra, rb, x, L, acc);
@@ -773,7 +832,12 @@ __device__ __forceinline__ uint8_t b3(const int *d, int n) {  // GGUF base-3 byt
 // raw GGUF matrix (ty = ggml id) -> repacked layout; one thread per source block. grid ceil(blocks / 256), block 256
 extern "C" __global__ void repack_expert(int ty, const uint8_t *src, uint8_t *dst, int rows, int k) {
   size_t bid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (ty == 42) {  // Q2_0
+  if (ty == 10 || ty == 18) {
+    size_t nb = k / 256;
+    if (bid >= rows * nb) return;
+    const int bs = ty == 10 ? 84 : 98;
+    for (int i=0; i<bs; i++) dst[bid*bs+i] = src[bid*bs+i];
+  } else if (ty == 42) {  // Q2_0
     size_t nb = k / 64, ng = k / 256;
     if (bid >= rows * nb) return;
     size_t r = bid / nb, b = bid % nb;
@@ -881,7 +945,10 @@ extern "C" __global__ void repack_expert(int ty, const uint8_t *src, uint8_t *ds
 // weight (r, c) of a repacked matrix (prefill's dequant_f16)
 __device__ float rp_weight(int t, const uint8_t *w, int rows, int k, int r, int c) {
   int o = c & 63, g = o >> 4, q = (o >> 2) & 3, i = o & 3;  // group g, quad position q, byte i inside the chunk
-  if (t == RP_Q2) {
+  if (t == RP_Q2K || t == RP_IQ3XXS) {
+    const uint8_t *p = w + ((size_t)r*(k/256)+c/256)*(t == RP_Q2K ? 84 : 98);
+    return t == RP_Q2K ? q2k_value(p,c&255) : iq3xxs_value(p,c&255);
+  } else if (t == RP_Q2) {
     size_t nb = k / 64, ng = k / 256, b = c / 64;
     unsigned v = *(const unsigned *)(w + (((size_t)r * ng + b / 4) * 4 + q) * 16 + (b % 4) * 4);
     int code = (v >> (8 * i + 2 * g)) & 3;

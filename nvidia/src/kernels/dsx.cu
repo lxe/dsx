@@ -1387,6 +1387,9 @@ extern "C" __global__ void dequant_f16(int t, const uint8_t *w, const uint8_t *s
     const uint8_t *blk = w + (size_t)r * (k / 64) * 18 + (c / 64) * 18;
     int i = c % 64;
     v = ld_h(blk) * (float)(((blk[2 + i / 4] >> (2 * (i % 4))) & 3) - 1);
+  } else if (t == 10 || t == 18) {
+    const uint8_t *p = w + ((size_t)r*(k/256)+c/256)*(t == 10 ? 84 : 98);
+    v = t == 10 ? q2k_value(p,c&255) : iq3xxs_value(p,c&255);
   } else if (t == 16) {  // IQ2_XXS
     const uint8_t *blk = w + (size_t)r * (k / 256) * 66 + (c / 256) * 66;
     v = iq2_value(blk + 2 + ((c & 255) >> 5) * 8, ld_h(blk), c & 31);

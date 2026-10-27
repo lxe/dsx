@@ -59,7 +59,11 @@ pub enum GType {
     F32 = 0,
     F16 = 1,
     Q8_0 = 8,
+    /// ggml Q2_K: 2-bit codes, 4-bit scales/minima per 16, two fp16 scales per 256
+    Q2K = 10,
     Q3K = 11,
+    /// ggml IQ3_XXS: 4-weight codebook entries, sign patterns and scale per 32
+    Iq3Xxs = 18,
     /// ggml Q5_K: 5-bit codes, 6-bit scales and mins per 32 (shared experts in llama.cpp mixes)
     Q5K = 13,
     Q6K = 14,
@@ -95,6 +99,8 @@ impl GType {
             0 => GType::F32,
             1 => GType::F16,
             8 => GType::Q8_0,
+            10 => GType::Q2K,
+            18 => GType::Iq3Xxs,
             11 => GType::Q3K,
             13 => GType::Q5K,
             14 => GType::Q6K,
@@ -122,6 +128,8 @@ impl GType {
             GType::I8 => (1, 1),
             GType::I32 => (1, 4),
             GType::Q8_0 => (32, 34),
+            GType::Q2K => (256, 84),
+            GType::Iq3Xxs => (256, 98),
             GType::Q3K => (256, 110),
             GType::Q5K => (256, 176),
             GType::Q6K => (256, 210),
