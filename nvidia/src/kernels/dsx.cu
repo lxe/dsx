@@ -4,6 +4,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+// Volta (SM70) compatibility shims: kept first so every later kernel header (moe/expert_fast/t16/...) can use them
+#include "sm70.cuh"
 
 #define MAXT 8
 
@@ -774,15 +776,21 @@ extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const floa
   sparse_attn_tc_body<false>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
 }
 #else
-// SM70 stubs: same kernel names (loaded by name via cuModuleGetFunction) so the fatbin keeps its export surface;
-// the bodies write nothing until the real Volta port lands (Phase 3).
+// SM70 stubs: same kernel names (loaded by name via cuModuleGetFunction) so the fatbin keeps its export surface.
+// Volta has no ldmatrix / mma / cp.async; prefill attention there goes through the CUDA-core `sparse_attn`
+// (attn.rs selects it when arch < 80), so reaching these means a wiring bug — trap loudly instead of silently
+// writing nothing.
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                   const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                   const float *sinks, float *o, int H, int hd, float scale) {
+  (void)q; (void)win; (void)win_idx; (void)W; (void)comp; (void)comp_idx; (void)K; (void)sinks; (void)o; (void)H; (void)hd; (void)scale;
+  __trap();
 }
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                        const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                        const float *sinks, float *o, int H, int hd, float scale) {
+  (void)q; (void)win; (void)win_idx; (void)W; (void)comp; (void)comp_idx; (void)K; (void)sinks; (void)o; (void)H; (void)hd; (void)scale;
+  __trap();
 }
 #endif
 
@@ -1224,7 +1232,6 @@ extern "C" __global__ void swiglu_s(const float *g, const float *u, float *h, in
 #include "expert_fast.cuh"
 #include "dequant_iq8.cuh"
 #include "t16.cuh"
-#include "sm70.cuh"
 
 // ---------------------------------------------------------------- cross-device expert handoff (mapped host memory)
 // xch layout (bytes): route_flag @0, cpu_flag @64, gpu1_flag @128, ntok @192, sel[8][8] i32 @256, wts[8][8] f32 @512,
