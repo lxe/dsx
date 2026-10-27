@@ -93,6 +93,14 @@ impl Engine for Real {
         self.snap = Some(self.gm.snapshot()?);
         self.cached = key;
         let prefill = t0.elapsed();
+        // DSX_PROFILE_SERVER_V1: per-request counters, no model math changes.
+        let profile = std::env::var_os("DSX_TIMING_LOG").is_some();
+        let counters0 = profile.then(|| (
+            self.gm.cpu_busy_s(), self.gm.cpu_picks(), self.gm.cpu_split_s(),
+        ));
+        // Snapshot rather than clear: preserve cumulative event profiling for other consumers.
+        let events0 = if profile { self.gm.evprof.clone() } else { None };
+        let mut profile_steps = 0usize;
         let td = Instant::now();
         let mut sampler = Sampler::from_params(p);
         let mut fin = Finish::Length;
@@ -117,9 +125,32 @@ impl Engine for Real {
                 break;
             }
             logits = self.gm.step(tok)?;
+            if profile { profile_steps += 1; }
             self.cached.push(tok);
         }
         self.stats = GenStats { prefill: Some(prefill), decode: Some(td.elapsed()), cached_prompt_tokens: start };
+        if let Some((busy0, picks0, split0)) = counters0 {
+            let picks1 = self.gm.cpu_picks();
+            let split1 = self.gm.cpu_split_s();
+            let n = profile_steps.max(1) as f64;
+            eprintln!("DSX_PROFILE_SERVER_V1 request prompt={} cached={} prefill_s={:.6} decode_s={:.6} steps={}",
+                prompt.len(), start, prefill.as_secs_f64(), self.stats.decode.unwrap_or_default().as_secs_f64(), profile_steps);
+            eprintln!("DSX_PROFILE_CPU busy_ms_per_step={:.6} picks_percent={:.6} idle_ms_per_step={:.6} prep_ms_per_step={:.6} forward_ms_per_step={:.6}",
+                (self.gm.cpu_busy_s()-busy0)*1000.0/n,
+                picks1.1.saturating_sub(picks0.1) as f64*100.0/picks1.0.saturating_sub(picks0.0).max(1) as f64,
+                (split1[0]-split0[0])*1000.0/n, (split1[1]-split0[1])*1000.0/n,
+                (split1[2]-split0[2])*1000.0/n);
+            if let Some(events) = &self.gm.evprof {
+                let before = |key: &str| events0.as_ref().and_then(|m| m.get(key)).copied().unwrap_or(0.0);
+                let steps = events.get("steps").copied().unwrap_or(0.0) - before("steps");
+                eprintln!("DSX_PROFILE_EVENT_STEPS {}", steps);
+                if steps > 0.0 {
+                    for (stage, ms) in events.iter().filter(|(k, _)| **k != "steps") {
+                        eprintln!("DSX_PROFILE_EVENT {:?} ms_per_step={:.6}", stage, (ms - before(stage))/steps);
+                    }
+                }
+            }
+        }
         let _ = Duration::ZERO;
         Ok(fin)
     }
