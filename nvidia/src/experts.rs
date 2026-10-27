@@ -684,8 +684,9 @@ impl GpuExperts {
         let (tab, base, e) = (Arg::P(self.tab.ptr), Arg::P(self.buf.ptr), Arg::I(self.n_experts as i32));
         let (li, ki, ti) = (Arg::I(l as i32), Arg::I(k as i32), Arg::I(t as i32));
         let blocks = |warps: usize| ((warps as u32).div_ceil(4), 1, 1);
-        // DSX_T16_GEMV=0: the GEMV before cp.async staging (same launch and output bits; for A/Bs)
-        let old = std::env::var("DSX_T16_GEMV").is_ok_and(|v| v == "0");
+        // DSX_T16_GEMV=0: the GEMV before cp.async staging (same launch and output bits; for A/Bs). SM70 has no
+        // cp.async: there the plain kernel is picked by the device arch at run time (the env still overrides).
+        let old = g.is_sm70() || std::env::var("DSX_T16_GEMV").is_ok_and(|v| v == "0");
         let gemv = |k2: usize| self.k[if old { ["t16d_gemv0_3", "t16d_gemv0_4", "t16d_gemv0_5"] } else { ["t16d_gemv_3", "t16d_gemv_4", "t16d_gemv_5"] }[k2 - 3]];
         for (role, xp, xd, xs) in [(0, b.xpg, b.xdg, b.xsg), (1, b.xpu, b.xdu, b.xsu)] {
             g.launch(self.k["t16d_prep"], blocks(picks * dim / 256), 128, 0, &[Arg::P(x), Arg::I(0), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(role), Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(kg as i32), Arg::P(xp), Arg::P(xd), Arg::P(xs)])?;

@@ -120,6 +120,11 @@ impl Gpu {
         Ok(n)
     }
 
+    /// the device is SM 7.0 (Volta; no cp.async): guarded-off kernels take their plain fallback, chosen at run time
+    pub fn is_sm70(&self) -> bool {
+        self.arch == 70
+    }
+
     /// host -> device bandwidth from pinned memory in GB/s (best of 3 copies of `stage`), which tells the link
     /// width apart (x16 vs x4)
     pub fn h2d_gbs(&self, stage: &HostBuf) -> Result<f64> {
