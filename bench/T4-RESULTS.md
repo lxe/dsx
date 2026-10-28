@@ -1,8 +1,8 @@
 # T4 results — SM70 prefill attention (Option A wiring)
 
-Date: 2026-10-27. Host: debianv100s (`ssh dogda@192.168.2.216`), Tesla V100-PCIE-32GB 80 SMs,
-GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8, max SM clock 1380 MHz, CUDA 12.9. All GPU runs under
-`flock /tmp/dsx-gpu.lock`, `CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-...`, `CUDA_ARCHS=70`.
+Date: 2026-10-27. Host: a 2x V100-PCIE-32GB host (`ssh <v100-host-user>@<v100-host>`), Tesla V100-PCIE-32GB 80 SMs,
+<gpu0-uuid>, max SM clock 1380 MHz, CUDA 12.9. All GPU runs under
+`flock /tmp/dsx-gpu.lock`, `CUDA_VISIBLE_DEVICES=<gpu0-uuid>`, `CUDA_ARCHS=70`.
 Harness: `nvidia/tests/gpu_attn_sm70.rs` (new; accuracy + `--ignored` perf).
 
 ```

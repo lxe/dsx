@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+# core: model, readers, CPU reference, server; nvidia: the 2x RTX 3090 / RTX 5090 runner (CUDA);
+# amd: the single-MI325X runner (HIP, needs ROCm to link: cargo build -p dsx-amd)
+members = ["core", "nvidia", "amd"]
+default-members = ["core", "nvidia"]
+
+[profile.release]
+debug = 1
+codegen-units = 4

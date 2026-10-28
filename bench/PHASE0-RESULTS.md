@@ -4,8 +4,8 @@ Date: 2026-10-27. Source: `dsx/bench/sm70_micro.cu` (standalone; CUDA runtime + 
 
 ## Environment
 
-- Host: debianv100s (`ssh dogda@192.168.2.216`), driver 580.173.02
-- GPU: Tesla V100-PCIE-32GB (UUID `GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8`), 80 SMs, max SM clock 1380 MHz, HBM2 @ 877 MHz (single GPU, exclusive use, run under `/tmp/dsx-gpu.lock`)
+- Host: a 2x V100-PCIE-32GB host (`ssh <v100-host-user>@<v100-host>`), driver 580.173.02
+- GPU: Tesla V100-PCIE-32GB (UUID `<gpu0-uuid>`), 80 SMs, max SM clock 1380 MHz, HBM2 @ 877 MHz (single GPU, exclusive use, run under `/tmp/dsx-gpu.lock`)
 - Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA **12.9** (V12.9.86) — note: the plan said CUDA 12.4; the box now runs 12.9. Build: `nvcc -O3 -arch=sm_70 -o sm70_micro sm70_micro.cu -lcublas`
 - Protocol: one correctness launch (CPU-checked) + 3 warmup + 20 timed iterations per benchmark, `cudaEvent` timing around the timed loop; K1 cycles a 272 MB pool (74 copies) of weight tables so L2 (6 MB) never serves a repeat, same protocol as `dsx/bench/t16_gemv.cu`.
 
@@ -47,10 +47,10 @@ GATE: K1 PASS (207.8 GB/s vs 35) K2 PASS (47.60 TFLOPS vs 25) K3 PASS (94.52 TFL
 ## Reproduce
 
 ```
-scp dsx/bench/sm70_micro.cu dogda@192.168.2.216:
-ssh dogda@192.168.2.216 '/usr/local/cuda/bin/nvcc -O3 -arch=sm_70 -Wno-deprecated-gpu-targets -o sm70_micro sm70_micro.cu -lcublas'
-ssh dogda@192.168.2.216 'flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8 ./sm70_micro'
+scp dsx/bench/sm70_micro.cu <v100-host-user>@<v100-host>:
+ssh <v100-host-user>@<v100-host> '/usr/local/cuda/bin/nvcc -O3 -arch=sm_70 -Wno-deprecated-gpu-targets -o sm70_micro sm70_micro.cu -lcublas'
+ssh <v100-host-user>@<v100-host> 'flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=<gpu0-uuid> ./sm70_micro'
 ```
 
 Optionally `./sm70_micro k1|k2|k3` runs a single benchmark.
-PHASE0-RESULTS.md: measured 2026-10-27 on debianv100s (2x V100-PCIE-32GB); source harness: dsx/bench/sm70_micro.cu in the outer workspace (untracked upstream); numbers anchor T3/T4/T5 gates.
+PHASE0-RESULTS.md: measured 2026-10-27 on a 2x V100-PCIE-32GB host (2x V100-PCIE-32GB); source harness: dsx/bench/sm70_micro.cu in the outer workspace (untracked upstream); numbers anchor T3/T4/T5 gates.

@@ -1,0 +1,60 @@
+[package]
+name = "dsx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "DeepSeek-V4.1-Flash inference for one machine: 2x RTX 3090, i7-12700K, 128 GB DDR4"
+publish = false
+
+[dependencies]
+dsx-core = { path = "../core" }
+memmap2 = "0.9"
+half = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rayon = "1"
+serde_json = "1"
+deepseek-recipe = "0.1"
+deepseek-recipe-core = "0.1"
+deepseek-recipe-encoding = "0.1"
+tokenizers = "0.23"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["time"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "cublas", "cuda-13000", "dynamic-loading"] }
+
+[dev-dependencies]
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+[[bin]]
+name = "dsx-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "t16-prefill-audit"
+path = "src/bin/t16-prefill-audit.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "t16-decode-check"
+path = "src/bin/t16-decode-check.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "t16-decode-probe"
+path = "src/bin/t16-decode-probe.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "prefill-bench"
+path = "src/bin/prefill-bench.rs"
+required-features = ["cuda"]
+
+[features]
+default = []
+cuda = ["dep:cudarc"]

@@ -1,9 +1,9 @@
 # T5: expert_fast int8-IMMA kernels -> dp4a on SM70 (V100)
 
 Date: 2026-10-27. Branch `t5-expert-dp4a` (on scaffold e88a39d). Worktree `dsx-sm70-t5`.
-Host: debianv100s (`ssh dogda@192.168.2.216`), Tesla V100-PCIE-32GB (80 SMs, driver 580.173.02), CUDA 12.9
+Host: a 2x V100-PCIE-32GB host (`ssh <v100-host-user>@<v100-host>`), Tesla V100-PCIE-32GB (80 SMs, driver 580.173.02), CUDA 12.9
 (`/usr/local/cuda/bin/nvcc`), all GPU runs under `flock /tmp/dsx-gpu.lock`, GPU UUID
-`GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8`.
+`<gpu0-uuid>`.
 
 ## What changed (`nvidia/src/kernels/expert_fast.cuh` only)
 

@@ -1,7 +1,7 @@
 # T3: decode path live on SM70 — runtime auto-select, correctness check, throughput probe
 
-Date: 2026-10-27. Host: `debianv100s` (`ssh dogda@192.168.2.216`), Tesla V100-PCIE-32GB
-(UUID `GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8`, 80 SMs, driver 580.173.02), CUDA 12.9
+Date: 2026-10-27. Host: `a 2x V100-PCIE-32GB host` (`ssh <v100-host-user>@<v100-host>`), Tesla V100-PCIE-32GB
+(UUID `<gpu0-uuid>`, 80 SMs, driver 580.173.02), CUDA 12.9
 (`/usr/local/cuda/bin`), Rust at `~/.cargo/bin`. Worktree `~/dsx-sm70-t3`, fatbin built with
 `CUDA_ARCHS=70`; every GPU run under `flock /tmp/dsx-gpu.lock`.
 
@@ -70,9 +70,9 @@ busier, hence 450 GB/s effective), and nothing near the 90 ms overhead line.
 cd ~/dsx-sm70-t3
 PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH CUDA_ARCHS=70 cargo build --release -p dsx --features cuda \
     --bin t16-decode-check --bin t16-decode-probe
-flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8 \
+flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=<gpu0-uuid> \
     ./target/release/t16-decode-check
-flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=GPU-4e4e3d86-f648-3706-6489-f5e8e17fcab8 \
+flock /tmp/dsx-gpu.lock env CUDA_VISIBLE_DEVICES=<gpu0-uuid> \
     ./target/release/t16-decode-probe
 ```
 
