@@ -1,6 +1,8 @@
-// sm70.cuh — Volta (SM70) compatibility for dsx kernels. Everything here is
-// additive: included unconditionally, but every SM70-only definition is used
-// from __CUDA_ARCH__-guarded call sites, so SM80+ builds never instantiate it.
+// sm70.cuh — Volta (SM70) helpers for dsx kernels. Included first from dsx.cu;
+// the whole body is __CUDA_ARCH__-guarded so SM80+ builds never instantiate it.
+// NOTE: no callers yet — the current SM70 port routes decode to the in-tree
+// gemv0 kernel and attention to the serial kernel, neither of which needs
+// these. dsx_cp16 is kept for the planned wmma attention upgrade (T4-NOTES).
 #pragma once
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 #define DSX_SM70 1
