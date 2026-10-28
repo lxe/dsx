@@ -314,6 +314,29 @@ macro_rules! tile {
     }};
 }
 
+macro_rules! tile_k15 {
+    ($t:ident, $x:ident, $kb:ident, $a0:ident, $a1:ident, $mul:ident; $($q:literal: ($ka:ident $($oa:literal)?, $kb2:ident $($ob:literal)?)),*) => {{
+        // K2=3: four adjacent columns occupy twelve bytes. All loads stay inside the 48-byte tile.
+        let mask = _mm_setr_epi8(3, 2, 1, 0, 6, 5, 4, 3, 9, 8, 7, 6, 12, 11, 10, 9);
+        let last_mask = _mm_setr_epi8(6, 5, 4, 3, 9, 8, 7, 6, 12, 11, 10, 9, 15, 14, 13, 12);
+        let head = _mm_loadu_si128($t.cast());
+        let tail = _mm_loadu_si128($t.add(32).cast());
+        let first = _mm_alignr_epi8::<15>(head, tail);
+        let l0 = _mm256_set_m128i(_mm_shuffle_epi8(_mm_loadu_si128($t.add(11).cast()), mask), _mm_shuffle_epi8(first, mask));
+        let l1 = _mm256_set_m128i(_mm_shuffle_epi8(tail, last_mask), _mm_shuffle_epi8(_mm_loadu_si128($t.add(23).cast()), mask));
+        // A high view needs at most its seven low bits; the previous low view supplies its low 24 bits.
+        let h0 = _mm256_srli_epi32::<8>(_mm256_alignr_epi8::<12>(l0, _mm256_permute2x128_si256::<0x21>(l1, l0)));
+        let h1 = _mm256_srli_epi32::<8>(_mm256_alignr_epi8::<12>(l1, _mm256_permute2x128_si256::<0x21>(l0, l1)));
+        $(
+            let xq = _mm256_set1_epi32(*$x.get_unchecked(8 * $kb + $q));
+            let w0 = _mm256_blend_epi16::<0b1010_1010>(sh!(l0, h0, $ka $($oa)?), sh!(l0, h0, $kb2 $($ob)?));
+            let w1 = _mm256_blend_epi16::<0b1010_1010>(sh!(l1, h1, $ka $($oa)?), sh!(l1, h1, $kb2 $($ob)?));
+            $a0 = dp($a0, _mm256_mullo_epi16(w0, $mul), xq);
+            $a1 = dp($a1, _mm256_mullo_epi16(w1, $mul), xq);
+        )*
+    }};
+}
+
 // tile! for N tokens (gemv_n), one half of the tile (columns 0-7: views 0 and 2, 8-15: 1 and 3): each pair's product
 // is decoded once and dotted with every token's pair word; for N > 4 gemv_n runs a group's 16 tiles per half, so the
 // N accumulators, two views and the shift temporaries fit the 16 registers up to N = 8
@@ -424,7 +447,7 @@ pub unsafe fn avx2_dp_pair(s: std::arch::x86_64::__m256i, pr: std::arch::x86_64:
 }
 
 macro_rules! t16_kernels {
-    ($m:ident, $feat:literal, $act:ident, $act1:ident,
+    ($m:ident, $feat:literal, $act:ident, $act1:ident, $compact_k15:literal,
      |$s:ident, $a:ident, $b:ident| $dp:expr,
      |$ps:ident| $psum:expr,
      |$sk:ident, $pk:ident, $qk:ident| $dpk:expr,
@@ -506,7 +529,49 @@ macro_rules! t16_kernels {
 
             #[allow(clippy::too_many_arguments)]
             #[target_feature(enable = $feat)]
+            pub unsafe fn gemv_k15(m: &[u8], k: usize, n: usize, a: &Act, nb0: usize, nb1: usize, out: &mut [f32], g0: usize, g1: usize) {
+                unsafe {
+                    assert!(m.len() >= t16::trellis_bytes(3, k, n) + 16 && nb1 <= n / 16 && a.$act.len() >= k / 2 && out.len() >= 16 * (nb1 - nb0));
+                    let (kt, tb) = (k / 16, 48);
+                    let mul = _mm256_set1_epi16(t16::MUL as i16);
+                    let x = &a.$act[..];
+                    for nb in nb0..nb1 {
+                        let o = out.as_mut_ptr().add((nb - nb0) * 16);
+                        let (mut f0, mut f1) = if g0 == 0 { (_mm256_setzero_ps(), _mm256_setzero_ps()) } else { (_mm256_loadu_ps(o), _mm256_loadu_ps(o.add(8))) };
+                        let col = m.as_ptr().add(nb * kt * tb);
+                        for gr in g0..g1 {
+                            let (mut a0, mut a1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+                            for kb in 16 * gr..16 * gr + 16 {
+                                let t = col.add(kb * tb);
+                                tile_k15!(t, x, kb, a0, a1, mul; 0: (lo 23, lo 5), 1: (lo 20, lo 2), 2: (lo 17, left 1), 3: (lo 14, left 4), 4: (lo 11, left 7), 5: (lo 8, left 10), 6: (lo 5, left 13), 7: (lo 2, left 16));
+                            }
+                            let d = _mm256_set1_ps(a.d[gr]);
+                            let c0 = _mm256_set1_ps(C_0 * a.s[gr] as f32);
+                            let cb = _mm256_set1_ps(C_B);
+                            f0 = _mm256_fmadd_ps(d, _mm256_fmsub_ps(cb, _mm256_cvtepi32_ps(a0), c0), f0);
+                            f1 = _mm256_fmadd_ps(d, _mm256_fmsub_ps(cb, _mm256_cvtepi32_ps(a1), c0), f1);
+                        }
+                        _mm256_storeu_ps(o, f0);
+                        _mm256_storeu_ps(o.add(8), f1);
+                    }
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            #[target_feature(enable = $feat)]
             pub unsafe fn gemv(m: &[u8], k2: usize, k: usize, n: usize, a: &Act, nb0: usize, nb1: usize, out: &mut [f32], g0: usize, g1: usize) {
+                unsafe {
+                    if $compact_k15 && k2 == 3 {
+                        gemv_k15(m, k, n, a, nb0, nb1, out, g0, g1);
+                    } else {
+                        gemv_generic(m, k2, k, n, a, nb0, nb1, out, g0, g1);
+                    }
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            #[target_feature(enable = $feat)]
+            pub unsafe fn gemv_generic(m: &[u8], k2: usize, k: usize, n: usize, a: &Act, nb0: usize, nb1: usize, out: &mut [f32], g0: usize, g1: usize) {
                 unsafe {
                     assert!(m.len() >= t16::trellis_bytes(k2, k, n) + 16 && nb1 <= n / 16 && a.$act.len() >= k / 2 && out.len() >= 16 * (nb1 - nb0));
                     let p = &plans()[k2 - 3];
@@ -701,21 +766,21 @@ macro_rules! t16_kernels {
 }
 
 t16_kernels!(
-    vnni, "avx2,avxvnni,fma,f16c,ssse3", x4, x1,
+    vnni, "avx2,avxvnni,fma,f16c,ssse3", x4, x1, false,
     |s, a, b| _mm256_dpbusd_avx_epi32(s, a, b),
     |p| p,
     |s, p, q| _mm256_dpbusd_avx_epi32(s, p, q),
     |s, a, b| _mm256_dpbusd_avx_epi32(s, a, b)
 );
 t16_kernels!(
-    vnni512, "avx2,avx512vnni,avx512vl,fma,f16c,ssse3", x4, x1,
+    vnni512, "avx2,avx512vnni,avx512vl,fma,f16c,ssse3", x4, x1, false,
     |s, a, b| _mm256_dpbusd_epi32(s, a, b),
     |p| p,
     |s, p, q| _mm256_dpbusd_epi32(s, p, q),
     |s, a, b| _mm256_dpbusd_epi32(s, a, b)
 );
 t16_kernels!(
-    avx2, "avx2,fma,f16c,ssse3", x8, xm1,
+    avx2, "avx2,fma,f16c,ssse3", x8, xm1, true,
     |s, pr, qp| unsafe { avx2_dp_pair(s, pr, qp) },
     |pr| _mm256_maddubs_epi16(pr, _mm256_set1_epi8(1)),
     |s, sums, qp| _mm256_add_epi32(s, _mm256_madd_epi16(sums, qp)),
@@ -1160,6 +1225,91 @@ mod tests {
             println!("  scalar: single {ts:.3} ms, multi(16) {tm_s:.3} ms");
             println!("  AVX2:   single {ta:.3} ms, multi(16) {tm_a:.3} ms");
             println!("  speedup: single {0:.1}x, multi {1:.1}x", ts / ta, tm_s / tm_a);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod compact_tests {
+    use super::*;
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()) && a.len() == b.len()
+    }
+
+    #[test]
+    fn avx2_k15_compact_matches_generic_slices_and_group_splits() {
+        if !Isa::Avx2.supported() { return; }
+        assert!(!same_bits(&[1.0], &[f32::from_bits(1.0f32.to_bits() ^ 1)]));
+        let mut seed = 0xf597_a3bc_c5e2_174d;
+        for (k, n) in [(256, 128), (512, 256), (2304, 128), (5120, 128)] {
+            for mode in 0..4 {
+                let m: Vec<u8> = (0..t16::matrix_bytes(t16::ty_for_k2(3).unwrap(), k, n))
+                    .map(|_| if mode == 1 { 255 } else { next(&mut seed) as u8 }).collect();
+                let mut a = Act { x4: vec![0; k / 2], x8: vec![0; k / 2], x1: vec![], xm1: vec![], d: vec![0.017; k / 256], s: vec![0; k / 256] };
+                for i in 0..k {
+                    let q = match mode { 0 => 0, 1 => if i % 2 == 0 { -128 } else { 127 }, _ => (next(&mut seed) % 256) as i32 - 128 };
+                    let b = (q & 255) as u32;
+                    a.x4[i / 2] |= ((b | b << 8) << (16 * (i % 2))) as i32;
+                    a.x8[i / 2] |= ((q as i16 as u16 as u32) << (16 * (i % 2))) as i32;
+                    a.s[i / 256] += q;
+                }
+                for (nb0, nb1) in [(0, n / 16), (1, 5)] {
+                    let mut want = vec![0.0; 16 * (nb1 - nb0)];
+                    let mut got = want.clone();
+                    unsafe {
+                        avx2::gemv_generic(&m, 3, k, n, &a, nb0, nb1, &mut want, 0, k / 256);
+                        avx2::gemv_k15(&m, k, n, &a, nb0, nb1, &mut got, 0, k / 256);
+                    }
+                    assert!(same_bits(&want, &got), "k={k} mode={mode} columns={nb0}..{nb1}");
+                    for split in 1..k / 256 {
+                        got.fill(0.0);
+                        unsafe {
+                            avx2::gemv_k15(&m, k, n, &a, nb0, nb1, &mut got, 0, split);
+                            avx2::gemv_k15(&m, k, n, &a, nb0, nb1, &mut got, split, k / 256);
+                        }
+                        assert!(same_bits(&want, &got), "k={k} mode={mode} split={split}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_k15_compact_handles_every_tile_bit_and_input_row() {
+        if !Isa::Avx2.supported() { return; }
+        let (k, n) = (256, 16);
+        let bytes = t16::trellis_bytes(3, k, n) + 16;
+        // Offset the slice to exercise unaligned loads, including the last tile.
+        let mut storage = vec![0u8; bytes + 1];
+        for tile in [0, 15] {
+            for bit in 0..384 {
+                storage.fill(0);
+                let m = &mut storage[1..];
+                m[tile * 48 + bit / 8] = 1 << (bit % 8);
+                for row in 0..16 {
+                    for q in [-128i32, 1, 127] {
+                        let mut a = Act { x4: vec![0; k / 2], x8: vec![0; k / 2], x1: vec![], xm1: vec![], d: vec![1.0], s: vec![q] };
+                        let i = 16 * tile + row;
+                        let b = (q & 255) as u32;
+                        a.x4[i / 2] = ((b | b << 8) << (16 * (i % 2))) as i32;
+                        a.x8[i / 2] = ((q as i16 as u16 as u32) << (16 * (i % 2))) as i32;
+                        let (mut want, mut got) = ([0.0; 16], [0.0; 16]);
+                        unsafe {
+                            avx2::gemv_generic(m, 3, k, n, &a, 0, 1, &mut want, 0, 1);
+                            avx2::gemv_k15(m, k, n, &a, 0, 1, &mut got, 0, 1);
+                        }
+                        assert!(same_bits(&want, &got), "tile={tile} bit={bit} row={row} q={q}");
+                    }
+                }
+            }
         }
     }
 }
