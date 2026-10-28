@@ -120,6 +120,14 @@ impl Gpu {
         Ok(n)
     }
 
+    /// the device is pre-SM80 (SM 7.x: Volta has no cp.async; SM75 is intentionally covered by the same pre-SM80
+    /// guards — a multi-arch fatbin JIT'd onto SM75 must also pick the plain gemv): guarded-off kernels take their
+    /// plain fallback, chosen at run time. arch is major*10+minor (70, 86, 120 — not the __CUDA_ARCH__ scale of
+    /// 700/800); pre-SM80 = arch < 80.
+    pub fn is_pre_sm80(&self) -> bool {
+        self.arch < 80
+    }
+
     /// host -> device bandwidth from pinned memory in GB/s (best of 3 copies of `stage`), which tells the link
     /// width apart (x16 vs x4)
     pub fn h2d_gbs(&self, stage: &HostBuf) -> Result<f64> {

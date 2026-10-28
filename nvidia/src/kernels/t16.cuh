@@ -343,6 +343,9 @@ __device__ __forceinline__ int t16_dp4a(uint32_t a, int b, int c) {
 }
 
 // part [S][T K][n]: split s of k's 256-groups. One warp per (pick, pair of tile columns, split); block 128.
+// SM80 only (cp.async staging); on SM70 the t16d_gemv_##K2 kernels below run the plain t16d_gemv0_k body instead
+// (bit-identical output; the staged kernel's SM70 port lands in a later task).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <int K2>
 __device__ __forceinline__ void t16d_gemv_k(const uint4 *__restrict__ xp, const float *__restrict__ xd, const int *__restrict__ xs,
                                             const int *__restrict__ sel, const ExpSlot *__restrict__ tab, const unsigned char *__restrict__ base,
@@ -416,6 +419,7 @@ __device__ __forceinline__ void t16d_gemv_k(const uint4 *__restrict__ xp, const 
   }
   part[((size_t)s * picks + j) * n + 16 * nb + c] = f;
 }
+#endif  // __CUDA_ARCH__ >= 800
 // DSX_T16_GEMV=0: the kernel before the cp.async staging (for A/Bs; same launch, same output bits).
 // part [S][T K][n]: split s of k's 256-groups. One warp per (pick, pair of tile columns, split); block 128.
 template <int K2>
@@ -461,12 +465,23 @@ T16D_GEMV0(3)
 T16D_GEMV0(4)
 T16D_GEMV0(5)
 
+// SM80+: the cp.async-staged kernel. SM70: the same exported kernel name over the plain, bit-identical t16d_gemv0_k
+// body (a preprocessor directive cannot go inside a #define body, so the macro is duplicated per arch).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 #define T16D_GEMV(K2)                                                                                                                   \
   extern "C" __global__ void __launch_bounds__(128) t16d_gemv_##K2(const uint4 *xp, const float *xd, const int *xs, const int *sel,   \
                                                                    const ExpSlot *tab, const unsigned char *base, int layer, int E,     \
                                                                    int K, int T, int role, int k, int n, int S, float *part) {          \
     t16d_gemv_k<K2>(xp, xd, xs, sel, tab, base, layer, E, K, T, role, k, n, S, part);                                                  \
   }
+#else
+#define T16D_GEMV(K2)                                                                                                                   \
+  extern "C" __global__ void __launch_bounds__(128) t16d_gemv_##K2(const uint4 *xp, const float *xd, const int *xs, const int *sel,   \
+                                                                   const ExpSlot *tab, const unsigned char *base, int layer, int E,     \
+                                                                   int K, int T, int role, int k, int n, int S, float *part) {          \
+    t16d_gemv0_k<K2>(xp, xd, xs, sel, tab, base, layer, E, K, T, role, k, n, S, part);                                                 \
+  }
+#endif
 T16D_GEMV(3)
 T16D_GEMV(4)
 T16D_GEMV(5)
