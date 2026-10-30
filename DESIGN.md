@@ -77,6 +77,13 @@ arena and repacked on a side stream.
 - Prefix reuse: the KV of the current conversation stays on the GPU. The engine keeps a bounded history of
   prompt-boundary snapshots and resumes from the newest checkpoint at or before the longest common token prefix;
   only a prefix shorter than every checkpoint starts a cold prefill. Exact retries reuse checkpoint logits.
+- Multi-session prefix cache (`--cache-sessions N > 1`): one lineage is live in the `GpuModel`; the others are parked
+  as full backing states in a bounded, lazily committed host arena (`--session-cache-gb`, hard committed-byte limit).
+  Prompt checkpoints (rewind + boundary logits) stay per lineage, and sparse periodic prefix anchors (rewind state,
+  no logits, `--prefix-anchor-tokens`, default 16384) let a second agent rewind into a shared system/tools prefix and
+  prefill only its divergent tail. Whole inactive sessions are evicted by LRU on the session-count or byte budget.
+  The default `--cache-sessions 1` keeps the previous fast path with no host parking. Architecture and state audit:
+  [docs/session-cache.md](docs/session-cache.md).
 - llama.cpp's web UI is embedded and served at `/`, with the llama.cpp endpoints it expects (`/props`, `/slots`) and
   a `timings` chunk at the end of streamed responses.
 - Optional `--api-key`: one shared key, checked before every route that runs the model, in `Authorization: Bearer`

@@ -3,6 +3,7 @@
 
 use crate::gguf::GType;
 use crate::gpu::{Arg, Buf, Gpu, Kernel};
+use crate::hostcache::{Extent, HostCacheArena};
 use crate::model::{Mat, Model, dot, matvec};
 use crate::numerics::{round_bf16, silu};
 use anyhow::{Result, bail};
@@ -1915,13 +1916,187 @@ pub struct Snapshot {
     engram_len: usize,
 }
 
+/// Per-layer geometry of the persistent KV state, taken from the runtime `Config` (no checkpoint-specific constants):
+/// the window-ring bytes of every layer, the compressor carry bytes of the layers that own compressed state, and the
+/// row widths of the compressed / index-key caches.
+#[derive(Debug, Clone)]
+pub struct StateGeometry {
+    /// per layer: window ring, bf16 [window][head_dim]
+    pub ring_bytes: usize,
+    /// per layer: 0, or the compressor's kv + score carry groups (any ratio > 1)
+    pub state_bytes: Vec<usize>,
+    /// per layer: 0, or one compressed-cache row (bf16 [head_dim]) for the KV source layers
+    pub comp_row_bytes: Vec<usize>,
+    /// per layer: 0, or one index-key row (bf16 [idx_dim]) for the index-key owners
+    pub idx_row_bytes: Vec<usize>,
+}
+
+impl StateGeometry {
+    pub fn layers(&self) -> usize {
+        self.state_bytes.len()
+    }
+
+    /// Bytes of a lightweight rewind state (window rings + compressor carry of every layer).
+    pub fn rewind_bytes(&self) -> usize {
+        self.ring_bytes * self.layers() + self.state_bytes.iter().sum::<usize>()
+    }
+
+    pub fn state_total(&self) -> usize {
+        self.state_bytes.iter().sum()
+    }
+}
+
+/// A lightweight rewind point held in the host arena: every layer's window ring and compressor carry, the row
+/// counters and the Engram history length. Compressed KV / index rows stay append-only on the device, so the counters
+/// describe them. Prompt checkpoints and prefix anchors share this layout; only prompt checkpoints carry logits, and
+/// those live in the session entry (not here).
+pub struct HostRewindState {
+    pub pos: usize,
+    pub counters: Vec<(usize, usize)>,
+    pub engram_len: usize,
+    rings: Extent,
+    states: Option<Extent>,
+    payload_bytes: usize,
+}
+
+impl HostRewindState {
+    /// Arena bytes held by this rewind state (aligned extents).
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    /// Return the extents to the arena (branch invalidation, checkpoint trimming, session eviction).
+    pub fn free(&self, arena: &mut HostCacheArena) {
+        arena.free(self.rings);
+        if let Some(s) = self.states {
+            arena.free(s);
+        }
+    }
+}
+
+/// A complete backing state of an independent conversation lineage, parked in the host arena.
+///
+/// Persistent sequence state (copied): `pos`, every layer's window ring, the used compressed-cache rows, the used
+/// index-key rows, the compressor carry/state, `n_comp`, `n_idx`, the full Engram token history and the raw
+/// next-token logits of the live state.
+///
+/// Not persistent, audited before this type was added:
+///
+/// * `seq_base` — a monotonic handoff sequence number for the CPU/aux worker protocol. It is never rewound on a
+///   session switch (the worker only needs it to advance).
+/// * adaptive expert state — expert residency, replacement state, decayed usage/hotness, adapt flags and placement.
+///   These follow the machine and the current token stream, not a conversation.
+/// * transient buffers, rebuilt by the next request: `images` / `img_rows`, `dpost`, `post_attn_done`,
+///   `post_ffn_done`, `verify_t` / `vpass` / `vsnap` / `vrows`, scratch buffers, CUDA events and the candidate /
+///   top-k / prefill scratch.
+///
+/// Only rows actually used (`n_comp`, `n_idx`) are copied: a `max_ctx`-sized cache of another session never rides
+/// along.
+pub struct ParkedState {
+    pub pos: usize,
+    pub counters: Vec<(usize, usize)>,
+    pub engram: Vec<i64>,
+    /// raw model logits after the parked sequence (hesitation penalties are applied to a sampling copy only)
+    pub logits: Vec<f32>,
+    rings: Extent,
+    states: Option<Extent>,
+    /// per layer: used compressed-cache rows (None when the layer owns no compressed cache)
+    comp: Vec<Option<Extent>>,
+    /// per layer: used index-key rows (None when the layer owns no index cache)
+    idx: Vec<Option<Extent>>,
+    payload_bytes: usize,
+}
+
+impl ParkedState {
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    /// Return every extent to the arena.
+    pub fn free(&self, arena: &mut HostCacheArena) {
+        arena.free(self.rings);
+        if let Some(s) = self.states {
+            arena.free(s);
+        }
+        for e in self.comp.iter().chain(self.idx.iter()).flatten() {
+            arena.free(*e);
+        }
+    }
+}
+
+fn align_up(n: usize, align: usize) -> usize {
+    n.div_ceil(align) * align
+}
+
 impl GpuModel<'_> {
     fn ring_bytes(&self) -> usize {
         self.m.cfg.window * self.m.cfg.head_dim * 2
     }
 
+    /// Cumulative compressor-state offsets per layer (`layers + 1` entries). Ratios differ per layer, so a single
+    /// per-layer size would truncate or overrun the carry buffers of a model that is not ratio-2 everywhere.
+    fn state_offsets(&self) -> Vec<usize> {
+        let hd = self.m.cfg.head_dim;
+        let mut offs = Vec::with_capacity(self.layers.len() + 1);
+        offs.push(0);
+        for (i, l) in self.layers.iter().enumerate() {
+            let ratio = self.m.layers[i].ratio.max(1);
+            let bytes = if l.comp_state.is_some() { 2 * ratio * hd * 4 } else { 0 };
+            offs.push(offs[i] + bytes);
+        }
+        offs
+    }
+
     fn state_bytes(&self) -> usize {
-        2 * self.m.cfg.head_dim * 4 * 2 // kv + score, ratio 2
+        self.state_offsets().last().copied().unwrap_or(0)
+    }
+
+    /// Persistent-state geometry of this model instance.
+    pub fn state_geometry(&self) -> StateGeometry {
+        let c = &self.m.cfg;
+        let mut state_bytes = Vec::with_capacity(self.layers.len());
+        let mut comp_row_bytes = Vec::with_capacity(self.layers.len());
+        let mut idx_row_bytes = Vec::with_capacity(self.layers.len());
+        for (i, l) in self.layers.iter().enumerate() {
+            let ratio = self.m.layers[i].ratio.max(1);
+            state_bytes.push(if l.comp_state.is_some() { 2 * ratio * c.head_dim * 4 } else { 0 });
+            comp_row_bytes.push(if l.comp_cache.is_some() { c.head_dim * 2 } else { 0 });
+            idx_row_bytes.push(if l.idx_cache.is_some() { c.idx_dim * 2 } else { 0 });
+        }
+        StateGeometry { ring_bytes: self.ring_bytes(), state_bytes, comp_row_bytes, idx_row_bytes }
+    }
+
+    /// Bytes a parked copy of the current sequence needs right now (used rows only, extents aligned).
+    pub fn parked_state_bytes(&self) -> usize {
+        let geo = self.state_geometry();
+        let mut bytes = align_up(geo.ring_bytes * geo.layers(), crate::hostcache::EXTENT_ALIGN);
+        if geo.state_total() > 0 {
+            bytes += align_up(geo.state_total(), crate::hostcache::EXTENT_ALIGN);
+        }
+        for (i, l) in self.layers.iter().enumerate() {
+            if geo.comp_row_bytes[i] > 0 && l.n_comp > 0 {
+                bytes += align_up(l.n_comp * geo.comp_row_bytes[i], crate::hostcache::EXTENT_ALIGN);
+            }
+            if geo.idx_row_bytes[i] > 0 && l.n_idx > 0 {
+                bytes += align_up(l.n_idx * geo.idx_row_bytes[i], crate::hostcache::EXTENT_ALIGN);
+            }
+        }
+        bytes
+    }
+
+    /// Heap bytes a parked copy keeps outside the arena: the full Engram history and the raw next-token logits.
+    pub fn parked_heap_bytes(&self) -> usize {
+        self.engram_hist.len() * std::mem::size_of::<i64>() + self.m.cfg.vocab * std::mem::size_of::<f32>()
+    }
+
+    /// Bytes of a lightweight rewind state (the same layout for prompt checkpoints and prefix anchors).
+    pub fn rewind_state_bytes(&self) -> usize {
+        let geo = self.state_geometry();
+        let mut bytes = align_up(geo.ring_bytes * geo.layers(), crate::hostcache::EXTENT_ALIGN);
+        if geo.state_total() > 0 {
+            bytes += align_up(geo.state_total(), crate::hostcache::EXTENT_ALIGN);
+        }
+        bytes
     }
 
     pub fn max_ctx(&self) -> usize {
@@ -1930,14 +2105,16 @@ impl GpuModel<'_> {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         let rb = self.ring_bytes();
-        let sb = self.state_bytes();
+        let offs = self.state_offsets();
         let rings = self.g.alloc(rb * self.layers.len())?;
-        let states = self.g.alloc(sb * self.layers.len())?;
+        let states = self.g.alloc(self.state_bytes())?;
         for (i, l) in self.layers.iter().enumerate() {
             self.g.dtod(rings.ptr + (i * rb) as u64, l.window.ptr, rb)?;
             if let Some((k, s)) = &l.comp_state {
-                self.g.dtod(states.ptr + (i * sb) as u64, k.ptr, sb / 2)?;
-                self.g.dtod(states.ptr + (i * sb + sb / 2) as u64, s.ptr, sb / 2)?;
+                let ratio = self.m.layers[i].ratio.max(1);
+                let per = ratio * self.m.cfg.head_dim * 4;
+                self.g.dtod(states.ptr + offs[i] as u64, k.ptr, per)?;
+                self.g.dtod(states.ptr + (offs[i] + per) as u64, s.ptr, per)?;
             }
         }
         self.g.sync()?;
@@ -1952,34 +2129,285 @@ impl GpuModel<'_> {
 
     pub fn restore(&mut self, s: &Snapshot) -> Result<()> {
         let rb = self.ring_bytes();
-        let sb = self.state_bytes();
+        let offs = self.state_offsets();
         for (i, l) in self.layers.iter_mut().enumerate() {
             self.g.dtod(l.window.ptr, s.rings.ptr + (i * rb) as u64, rb)?;
             if let Some((k, st)) = &l.comp_state {
-                self.g.dtod(k.ptr, s.states.ptr + (i * sb) as u64, sb / 2)?;
-                self.g.dtod(st.ptr, s.states.ptr + (i * sb + sb / 2) as u64, sb / 2)?;
+                let ratio = self.m.layers[i].ratio.max(1);
+                let per = ratio * self.m.cfg.head_dim * 4;
+                self.g.dtod(k.ptr, s.states.ptr + offs[i] as u64, per)?;
+                self.g.dtod(st.ptr, s.states.ptr + (offs[i] + per) as u64, per)?;
             }
             (l.n_comp, l.n_idx) = s.counters[i];
         }
         self.engram_hist.truncate(s.engram_len);
         self.pos = s.pos;
+        self.topk_k = 0;
         self.g.sync()
     }
 
     /// Copy the decode state into `s` (buffers reused): verify_spec's rewind point.
     fn snapshot_into(&self, s: &mut Snapshot) -> Result<()> {
-        let (rb, sb) = (self.ring_bytes(), self.state_bytes());
+        let rb = self.ring_bytes();
+        let offs = self.state_offsets();
         for (i, l) in self.layers.iter().enumerate() {
             self.g.dtod(s.rings.ptr + (i * rb) as u64, l.window.ptr, rb)?;
             if let Some((k, st)) = &l.comp_state {
-                self.g.dtod(s.states.ptr + (i * sb) as u64, k.ptr, sb / 2)?;
-                self.g.dtod(s.states.ptr + (i * sb + sb / 2) as u64, st.ptr, sb / 2)?;
+                let ratio = self.m.layers[i].ratio.max(1);
+                let per = ratio * self.m.cfg.head_dim * 4;
+                self.g.dtod(s.states.ptr + offs[i] as u64, k.ptr, per)?;
+                self.g.dtod(s.states.ptr + (offs[i] + per) as u64, st.ptr, per)?;
             }
         }
         s.counters = self.layers.iter().map(|l| (l.n_comp, l.n_idx)).collect();
         s.engram_len = self.engram_hist.len();
         s.pos = self.pos;
         Ok(())
+    }
+
+    /// Capture a lightweight rewind point into the host arena. All copies are enqueued on the engine stream and the
+    /// stream is synchronized once before returning, so the arena bytes are safe to read/reuse afterwards (the
+    /// park/restore boundary groups copies; there is no per-row or per-layer synchronization).
+    pub fn capture_rewind(&self, arena: &mut HostCacheArena) -> Result<HostRewindState> {
+        let geo = self.state_geometry();
+        let layers = geo.layers();
+        let ring_total = geo.ring_bytes * layers;
+        let state_total = geo.state_total();
+        let rings = arena.allocate(ring_total).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let states = if state_total > 0 {
+            match arena.allocate(state_total) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    arena.free(rings);
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            }
+        } else {
+            None
+        };
+        let offs = self.state_offsets();
+        let ring_ptr = arena.extent_ptr(rings);
+        let state_ptr = states.map(|s| arena.extent_ptr(s));
+        let copy = (|| -> Result<()> {
+            for (i, l) in self.layers.iter().enumerate() {
+                self.g.dtoh_ptr(unsafe { ring_ptr.add(i * geo.ring_bytes) }, l.window.ptr, geo.ring_bytes)?;
+                if let (Some((k, s)), Some(base)) = (&l.comp_state, state_ptr) {
+                    let ratio = self.m.layers[i].ratio.max(1);
+                    let per = ratio * self.m.cfg.head_dim * 4;
+                    unsafe {
+                        self.g.dtoh_ptr(base.add(offs[i]), k.ptr, per)?;
+                        self.g.dtoh_ptr(base.add(offs[i] + per), s.ptr, per)?;
+                    }
+                }
+            }
+            self.g.sync()
+        })();
+        if let Err(e) = copy {
+            arena.free(rings);
+            if let Some(s) = states {
+                arena.free(s);
+            }
+            return Err(e);
+        }
+        let mut bytes = rings.len();
+        if let Some(s) = states {
+            bytes += s.len();
+        }
+        Ok(HostRewindState {
+            pos: self.pos,
+            counters: self.layers.iter().map(|l| (l.n_comp, l.n_idx)).collect(),
+            engram_len: self.engram_hist.len(),
+            rings,
+            states,
+            payload_bytes: bytes,
+        })
+    }
+
+    /// Rewind to a host-backed checkpoint/anchor: restore window rings and compressor carry, reset the row counters
+    /// and truncate the Engram history. Compressed and index rows below the counters stay as they are (append-only),
+    /// and rows above them are rewritten by the replay that follows.
+    pub fn restore_rewind(&mut self, arena: &HostCacheArena, s: &HostRewindState) -> Result<()> {
+        let geo = self.state_geometry();
+        let offs = self.state_offsets();
+        let ring_ptr = arena.extent_ptr(s.rings) as *const u8;
+        let state_ptr = s.states.map(|e| arena.extent_ptr(e) as *const u8);
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            self.g.htod_ptr(l.window.ptr, unsafe { ring_ptr.add(i * geo.ring_bytes) }, geo.ring_bytes)?;
+            if let (Some((k, st)), Some(base)) = (&l.comp_state, state_ptr) {
+                let ratio = self.m.layers[i].ratio.max(1);
+                let per = ratio * self.m.cfg.head_dim * 4;
+                unsafe {
+                    self.g.htod_ptr(k.ptr, base.add(offs[i]), per)?;
+                    self.g.htod_ptr(st.ptr, base.add(offs[i] + per), per)?;
+                }
+            }
+            (l.n_comp, l.n_idx) = s.counters[i];
+        }
+        self.engram_hist.truncate(s.engram_len);
+        self.pos = s.pos;
+        self.topk_k = 0;
+        self.g.sync()
+    }
+
+    /// Park the full backing state of the current sequence into the host arena (used rows only) together with the raw
+    /// next-token logits and the full Engram history. One synchronization covers every copy.
+    ///
+    /// `logits` is supplied by the caller instead of being read from the device: prefill writes its boundary logits
+    /// into `PrefillBufs`, so a request that ends before its first `step` would otherwise park stale decode logits.
+    pub fn park_state(&self, arena: &mut HostCacheArena, logits: Vec<f32>) -> Result<ParkedState> {
+        let geo = self.state_geometry();
+        let layers = geo.layers();
+        let ring_total = geo.ring_bytes * layers;
+        let state_total = geo.state_total();
+        let mut bytes = 0usize;
+        let cleanup = |arena: &mut HostCacheArena, rings: Extent, states: Option<Extent>, comp: Vec<Option<Extent>>, idx: Vec<Option<Extent>>| {
+            arena.free(rings);
+            if let Some(s) = states {
+                arena.free(s);
+            }
+            for e in comp.iter().chain(idx.iter()).flatten() {
+                arena.free(*e);
+            }
+        };
+        let rings = match arena.allocate(ring_total) {
+            Ok(e) => e,
+            Err(e) => return Err(anyhow::anyhow!("{e}")),
+        };
+        bytes += rings.len();
+        let states = if state_total > 0 {
+            match arena.allocate(state_total) {
+                Ok(e) => {
+                    bytes += e.len();
+                    Some(e)
+                }
+                Err(e) => {
+                    cleanup(arena, rings, None, vec![], vec![]);
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            }
+        } else {
+            None
+        };
+        let mut comp: Vec<Option<Extent>> = Vec::with_capacity(layers);
+        let mut idx: Vec<Option<Extent>> = Vec::with_capacity(layers);
+        for (i, l) in self.layers.iter().enumerate() {
+            let comp_row = geo.comp_row_bytes[i];
+            let idx_row = geo.idx_row_bytes[i];
+            let c = if comp_row > 0 && l.n_comp > 0 {
+                match arena.allocate(l.n_comp * comp_row) {
+                    Ok(e) => {
+                        bytes += e.len();
+                        Some(e)
+                    }
+                    Err(e) => {
+                        cleanup(arena, rings, states, comp, idx);
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+                }
+            } else {
+                None
+            };
+            let x = if idx_row > 0 && l.n_idx > 0 {
+                match arena.allocate(l.n_idx * idx_row) {
+                    Ok(e) => {
+                        bytes += e.len();
+                        Some(e)
+                    }
+                    Err(e) => {
+                        comp.push(c);
+                        cleanup(arena, rings, states, comp, idx);
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+                }
+            } else {
+                None
+            };
+            comp.push(c);
+            idx.push(x);
+        }
+        let offs = self.state_offsets();
+        let ring_ptr = arena.extent_ptr(rings);
+        let state_ptr = states.map(|e| arena.extent_ptr(e));
+        let copied = (|| -> Result<(Vec<f32>, Vec<i64>)> {
+            let engram = self.engram_hist.clone();
+            for (i, l) in self.layers.iter().enumerate() {
+                self.g.dtoh_ptr(unsafe { ring_ptr.add(i * geo.ring_bytes) }, l.window.ptr, geo.ring_bytes)?;
+                if let (Some((k, s)), Some(base)) = (&l.comp_state, state_ptr) {
+                    let ratio = self.m.layers[i].ratio.max(1);
+                    let per = ratio * self.m.cfg.head_dim * 4;
+                    unsafe {
+                        self.g.dtoh_ptr(base.add(offs[i]), k.ptr, per)?;
+                        self.g.dtoh_ptr(base.add(offs[i] + per), s.ptr, per)?;
+                    }
+                }
+                if let Some(e) = comp[i] {
+                    self.g.dtoh_ptr(arena.extent_ptr(e), l.comp_cache.as_ref().expect("comp cache").ptr, l.n_comp * geo.comp_row_bytes[i])?;
+                }
+                if let Some(e) = idx[i] {
+                    self.g.dtoh_ptr(arena.extent_ptr(e), l.idx_cache.as_ref().expect("index cache").ptr, l.n_idx * geo.idx_row_bytes[i])?;
+                }
+            }
+            self.g.sync()?;
+            Ok((logits, engram))
+        })();
+        let (logits, engram) = match copied {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup(arena, rings, states, comp, idx);
+                return Err(e);
+            }
+        };
+        Ok(ParkedState {
+            pos: self.pos,
+            counters: self.layers.iter().map(|l| (l.n_comp, l.n_idx)).collect(),
+            engram,
+            logits,
+            rings,
+            states,
+            comp,
+            idx,
+            payload_bytes: bytes,
+        })
+    }
+
+    /// Restore a parked backing state: window rings, compressor carry, every used compressed/index row, the counters,
+    /// the full Engram history, the position and the raw logits come back; the next prefill or decode continues from
+    /// exactly where the session was parked.
+    pub fn restore_state(&mut self, arena: &HostCacheArena, s: &ParkedState) -> Result<()> {
+        let geo = self.state_geometry();
+        let offs = self.state_offsets();
+        anyhow::ensure!(s.counters.len() == self.layers.len(), "parked state has {} layers, model has {}", s.counters.len(), self.layers.len());
+        let ring_ptr = arena.extent_ptr(s.rings) as *const u8;
+        let state_ptr = s.states.map(|e| arena.extent_ptr(e) as *const u8);
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            self.g.htod_ptr(l.window.ptr, unsafe { ring_ptr.add(i * geo.ring_bytes) }, geo.ring_bytes)?;
+            if let (Some((k, st)), Some(base)) = (&l.comp_state, state_ptr) {
+                let ratio = self.m.layers[i].ratio.max(1);
+                let per = ratio * self.m.cfg.head_dim * 4;
+                unsafe {
+                    self.g.htod_ptr(k.ptr, base.add(offs[i]), per)?;
+                    self.g.htod_ptr(st.ptr, base.add(offs[i] + per), per)?;
+                }
+            }
+            let (n_comp, n_idx) = s.counters[i];
+            if let (Some(e), Some(cache)) = (s.comp[i], l.comp_cache.as_ref()) {
+                let len = n_comp * geo.comp_row_bytes[i];
+                anyhow::ensure!(len <= e.len() && len <= cache.bytes, "parked compressed rows exceed the cache");
+                self.g.htod_ptr(cache.ptr, arena.extent_ptr(e) as *const u8, len)?;
+            }
+            if let (Some(e), Some(cache)) = (s.idx[i], l.idx_cache.as_ref()) {
+                let len = n_idx * geo.idx_row_bytes[i];
+                anyhow::ensure!(len <= e.len() && len <= cache.bytes, "parked index rows exceed the cache");
+                self.g.htod_ptr(cache.ptr, arena.extent_ptr(e) as *const u8, len)?;
+            }
+            l.n_comp = n_comp;
+            l.n_idx = n_idx;
+        }
+        self.engram_hist.clear();
+        self.engram_hist.extend_from_slice(&s.engram);
+        self.pos = s.pos;
+        self.topk_k = 0;
+        self.g.sync()
     }
 
     /// Speculative verify: like `verify` (logits after each of up to 8 tokens), but rewindable: `keep(k)` afterwards

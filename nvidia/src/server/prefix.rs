@@ -61,6 +61,145 @@ pub struct Decision {
     pub exact_retry: bool,
 }
 
+/// Which kind of state served an incoming prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateKind {
+    /// The full backing state sits at the end of the cached sequence (live on the GPU, or parked in host RAM):
+    /// restore it and replay only the tokens past the cached end.
+    Live,
+    /// A prompt-boundary checkpoint: restores a lightweight rewind state and carries boundary logits, so an exact
+    /// retry replays no prompt token.
+    PromptCheckpoint,
+    /// A sparse periodic prefix anchor: a lightweight rewind state without logits; the prompt tail after it is
+    /// always prefilled.
+    PrefixAnchor,
+    /// Nothing usable: prefill from token 0.
+    Cold,
+}
+
+impl StateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::PromptCheckpoint => "prompt-checkpoint",
+            Self::PrefixAnchor => "prefix-anchor",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// The latest usable resume point inside one lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewindPoint {
+    pub pos: usize,
+    pub kind: StateKind,
+    /// the point carries next-token logits (`prompt_len == pos`, or a restored full backing state)
+    pub has_logits: bool,
+}
+
+/// Choose the latest usable resume point of one session.
+///
+/// `full_state_pos` is the position of the complete backing state (the live GPU sequence or a parked copy), and is
+/// `None` when the lineage has no backing state. A full state at the cached end wins over a checkpoint at the same
+/// position: continuing costs neither a rewind copy nor a prefill. Otherwise the newest prompt checkpoint or anchor
+/// at or before the common prefix is used; on a tie the prompt checkpoint wins because it carries boundary logits.
+///
+pub fn best_rewind_point(
+    prompt_len: usize,
+    cached_len: usize,
+    raw_lcp: usize,
+    full_state_pos: Option<usize>,
+    prompt_checkpoints: &[usize],
+    anchors: &[usize],
+) -> RewindPoint {
+    debug_assert!(raw_lcp <= prompt_len.min(cached_len), "raw_lcp {raw_lcp} exceeds prompt {prompt_len} / cached {cached_len}");
+    if cached_len > 0 && raw_lcp == cached_len && full_state_pos == Some(cached_len) {
+        return RewindPoint { pos: cached_len, kind: StateKind::Live, has_logits: true };
+    }
+    let cp = prompt_checkpoints.iter().copied().filter(|&p| p <= raw_lcp).max();
+    // An anchor carries no logits, so an anchor exactly at the prompt end cannot serve a zero-token replay: the
+    // next-token logits would be missing. Older anchors (replay > 0) are valid; a prompt checkpoint at the same
+    // position is valid because it saved the boundary logits.
+    let an = anchors.iter().copied().filter(|&p| p <= raw_lcp && p < prompt_len).max();
+    let chosen = match (cp, an) {
+        (Some(c), Some(a)) if c >= a => (c, StateKind::PromptCheckpoint),
+        (Some(_), Some(a)) => (a, StateKind::PrefixAnchor),
+        (Some(c), None) => (c, StateKind::PromptCheckpoint),
+        (None, Some(a)) => (a, StateKind::PrefixAnchor),
+        (None, None) => return RewindPoint { pos: 0, kind: StateKind::Cold, has_logits: false },
+    };
+    RewindPoint { pos: chosen.0, kind: chosen.1, has_logits: chosen.1 == StateKind::PromptCheckpoint && prompt_len == chosen.0 }
+}
+
+/// What an incoming prompt does to the session it matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageAction {
+    /// Continue/retry/branch inside the same lineage: the session entry is mutated in place.
+    Mutate,
+    /// The prompt only shares a prefix with another lineage: the source stays parked and a new session entry is
+    /// created from its backing state plus the divergent tail.
+    NewFromPrefix,
+    /// Nothing usable: start from token 0.
+    ColdStart,
+}
+
+/// Deterministic same-lineage vs new-lineage rule (v1, no client session ids):
+///
+/// 1. `raw_lcp == cached_len` — the prompt carries the whole cached history: a continuation, an exact replay or the
+///    same conversation with a differently rendered generated tail. Mutate.
+/// 2. the selected point is a prompt checkpoint — the prompt branches from one of this lineage's own prompt
+///    boundaries (tool-call retry, edited tail). Mutate.
+/// 3. otherwise only a shared prefix anchor (or nothing) matched: a generic system/tools prefix is not a reason to
+///    destroy a long parked history, so this is a new lineage that keeps the source session intact.
+///
+pub fn classify_lineage(point: RewindPoint, raw_lcp: usize, cached_len: usize) -> LineageAction {
+    if point.kind == StateKind::Cold {
+        return LineageAction::ColdStart;
+    }
+    if cached_len > 0 && raw_lcp == cached_len {
+        return LineageAction::Mutate;
+    }
+    if point.kind == StateKind::PromptCheckpoint {
+        return LineageAction::Mutate;
+    }
+    LineageAction::NewFromPrefix
+}
+
+/// One session's reusable prefix for an incoming prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCandidate {
+    pub session_id: u64,
+    pub usable_start: usize,
+    pub kind: StateKind,
+    pub active: bool,
+    pub last_used: u64,
+}
+
+/// Pick the session to serve the prompt: the longest usable prefix, the active session on a tie (no park/restore
+/// switch), then the most recently used session, then the stable internal id. The result is deterministic.
+pub fn select_session(candidates: &[SessionCandidate]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, c) in candidates.iter().enumerate() {
+        if c.kind == StateKind::Cold || c.usable_start == 0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(b) => {
+                let b = &candidates[b];
+                c.usable_start > b.usable_start
+                    || (c.usable_start == b.usable_start
+                        && (c.active && !b.active
+                            || (c.active == b.active && (c.last_used > b.last_used || (c.last_used == b.last_used && c.session_id < b.session_id)))))
+            }
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 /// Count the identical leading tokens of two sequences. This is the real LCP: it is never shortened to force a
 /// replay token, because that would turn an exact retry into a false cache miss.
 pub fn longest_common_prefix(new: &[u32], cached: &[u32]) -> usize {
@@ -285,5 +424,91 @@ mod tests {
         assert_eq!(d.action, CacheAction::ColdReset);
         assert_eq!(d.start, 0);
         assert_eq!(d.replayed_tokens, 10);
+    }
+
+    // ---- multi-lineage policy (no GPU, no model) ----
+
+    #[test]
+    fn full_backing_state_wins_at_the_cached_end() {
+        let p = best_rewind_point(300, 200, 200, Some(200), &[50, 200], &[16, 100]);
+        assert_eq!(p, RewindPoint { pos: 200, kind: StateKind::Live, has_logits: true });
+    }
+
+    #[test]
+    fn checkpoint_is_preferred_over_anchor_at_the_same_position() {
+        let p = best_rewind_point(300, 400, 250, Some(400), &[100, 200], &[200]);
+        assert_eq!(p.pos, 200);
+        assert_eq!(p.kind, StateKind::PromptCheckpoint);
+        assert!(!p.has_logits);
+    }
+
+    #[test]
+    fn anchor_serves_a_shared_prefix_without_a_checkpoint() {
+        // A: 100K prompt with anchors every 16K; B shares 20K then diverges at token 0 of its own tail
+        let p = best_rewind_point(120_000, 100_000, 20_000, Some(100_000), &[100_000], &[16_384, 32_768]);
+        assert_eq!(p.pos, 16_384);
+        assert_eq!(p.kind, StateKind::PrefixAnchor);
+        assert!(!p.has_logits);
+        assert_eq!(classify_lineage(p, 20_000, 100_000), LineageAction::NewFromPrefix);
+    }
+
+    #[test]
+    fn exact_prompt_boundary_retry() {
+        let p = best_rewind_point(100_000, 100_500, 100_000, Some(100_500), &[100_000], &[16_384]);
+        assert_eq!(p, RewindPoint { pos: 100_000, kind: StateKind::PromptCheckpoint, has_logits: true });
+        assert_eq!(classify_lineage(p, 100_000, 100_500), LineageAction::Mutate);
+    }
+
+    #[test]
+    fn divergent_tail_of_the_same_conversation_mutates() {
+        // the prompt carries the whole cached history: same lineage
+        let p = best_rewind_point(100_500, 100_000, 100_000, Some(100_000), &[100_000], &[16_384]);
+        assert_eq!(p.kind, StateKind::Live);
+        assert_eq!(classify_lineage(p, 100_000, 100_000), LineageAction::Mutate);
+    }
+
+    #[test]
+    fn anchor_at_the_prompt_end_cannot_serve_a_zero_replay() {
+        let p = best_rewind_point(200, 300, 200, Some(300), &[], &[16, 200]);
+        assert_eq!(p.pos, 16, "the anchor at the prompt end has no boundary logits");
+        assert_eq!(p.kind, StateKind::PrefixAnchor);
+        assert!(!p.has_logits);
+    }
+
+    #[test]
+    fn no_usable_point_is_cold() {
+        let p = best_rewind_point(120_000, 100_000, 20_000, Some(100_000), &[100_000], &[]);
+        assert_eq!(p.kind, StateKind::Cold);
+        assert_eq!(classify_lineage(p, 20_000, 100_000), LineageAction::ColdStart);
+    }
+
+    fn cand(id: u64, start: usize, active: bool, last_used: u64) -> SessionCandidate {
+        SessionCandidate { session_id: id, usable_start: start, kind: StateKind::PromptCheckpoint, active, last_used }
+    }
+
+    #[test]
+    fn selection_prefers_the_longest_prefix() {
+        let cs = [cand(1, 100, false, 9), cand(2, 200, false, 5), cand(3, 150, false, 7)];
+        assert_eq!(select_session(&cs), Some(1));
+    }
+
+    #[test]
+    fn selection_prefers_active_on_a_tie() {
+        let cs = [cand(1, 200, false, 9), cand(2, 200, true, 5)];
+        assert_eq!(select_session(&cs), Some(1));
+    }
+
+    #[test]
+    fn selection_prefers_recent_then_stable_id() {
+        let cs = [cand(7, 200, false, 5), cand(4, 200, false, 5), cand(9, 200, false, 6)];
+        assert_eq!(select_session(&cs), Some(2), "most recently used wins");
+        let cs = [cand(7, 200, false, 5), cand(4, 200, false, 5)];
+        assert_eq!(select_session(&cs), Some(1), "stable id breaks the tie");
+    }
+
+    #[test]
+    fn cold_candidates_are_never_selected() {
+        let cs = [SessionCandidate { session_id: 1, usable_start: 0, kind: StateKind::Cold, active: true, last_used: 1 }];
+        assert_eq!(select_session(&cs), None);
     }
 }

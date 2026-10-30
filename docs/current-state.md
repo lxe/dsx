@@ -137,13 +137,20 @@ The first correctness task is the default-flags, fixed-residency comparison agai
 by individual kernel isolation. It requires a coordinated hardware window; the scripts in the results directory
 stop the server and should not be launched as unattended cleanup.
 
-Subsequent proposals include profiling the adaptive-cache scan, combining T16 gate/up launch work and improving
-multi-conversation prefix reuse. Within one conversation the server now keeps a bounded history of prompt-boundary
-KV snapshots (8) and rewinds to the newest checkpoint at or before the longest common prefix, so tool calls and
-retries avoid a full 200K+ token re-prefill. That is intra-conversation recovery, not a multi-conversation cache;
-the latter remains a proposal. Lower-bit dense weights are estimates, not implemented gains. Requantization is
-not currently scheduled. The gpu-unlock proposal was dropped. Old budget tables retain those proposals to explain
-their assumptions, not to designate current jobs.
+Subsequent proposals include profiling the adaptive-cache scan and combining T16 gate/up launch work. Within one
+conversation the server keeps a bounded history of prompt-boundary KV snapshots (8) and rewinds to the newest
+checkpoint at or before the longest common prefix, so tool calls and retries avoid a full 200K+ token re-prefill.
+
+The multi-conversation cache is implemented but **not yet validated at runtime** on this machine: `--cache-sessions
+N > 1` parks inactive lineages as full backing states in a bounded host arena (`--session-cache-gb`; committed arena
+bytes and the logical host payload are bounded), keeps host-backed prompt checkpoints and sparse prefix anchors
+(`--prefix-anchor-tokens`, default 16384), and
+evicts whole sessions by LRU on the session-count or byte budget. `--cache-sessions 1` remains the default fast path
+with no host parking. The design and state audit are in [session-cache.md](session-cache.md). Runtime validation was
+performed locally; benchmark numbers are not part of this change.
+Lower-bit dense weights are estimates, not implemented gains. Requantization is not currently scheduled. The
+gpu-unlock proposal was dropped. Old budget tables retain those proposals to explain their assumptions, not to
+designate current jobs.
 
 Before a benchmark, read actual power and thermal limits. The recorded October 23 window used 230 W GPU limits
 and a 125/180 W CPU cap. An October 24 read-only check found the CPU long-term limit at ~4095.9 W, not 125 W, with

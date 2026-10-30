@@ -36,7 +36,13 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 |---|---|
 | `--arena-gb` | RAM for experts the CPU computes (default 0; ~110 on 128 GB) |
 | `--chunk` | prefill tokens per pass (default 4096); smaller leaves more VRAM for experts |
+| `--cache-sessions N` | conversation lineages kept for prefix reuse, including the active one (default 1). `1` is the existing single-lineage fast path with no host parking; `>1` parks inactive lineages in the host cache so `A -> B -> A` resumes instead of prefilling from token 0 |
+| `--session-cache-gb X` | hard budget for the host cache of inactive lineages, decimal GB (default 8). Admission bounds committed arena bytes and the logical host payload (arena extents, saved logits, Engram histories); exceeding it degrades the hit rate, never correctness. Ignored by `--cache-sessions 1` |
+| `--prefix-anchor-tokens N` | sparse prefix-anchor interval in prompt tokens for multi-session mode (default 16384; `0` disables anchors). A second agent sharing a long system/tools prefix replays only the divergent tail from an earlier anchor |
 | `DSX_GPUS=0,2` | use only these GPUs (all by default) |
+
+Multi-session cache architecture and state audit: [session-cache.md](session-cache.md). Runtime validation was
+performed locally; benchmark numbers are not part of this change.
 
 **Speed**
 
