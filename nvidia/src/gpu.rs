@@ -300,6 +300,24 @@ impl Gpu {
         unsafe { check(cu::cuMemcpyDtoDAsync_v2(dst, src, bytes, self.stream), "cuMemcpyDtoDAsync") }
     }
 
+    /// Record a device -> host copy on the stream (host destination may be CUDA-registered or pageable).
+    pub fn dtoh_ptr(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+        self.bind();
+        unsafe {
+            check(cu::cuMemcpyDtoHAsync_v2(dst as *mut c_void, src, bytes, self.stream), "cuMemcpyDtoHAsync")?;
+            Ok(())
+        }
+    }
+
+    /// Record a host -> device copy on the stream (host source should be page-locked for real asynchrony).
+    pub fn htod_ptr(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        self.bind();
+        unsafe {
+            check(cu::cuMemcpyHtoDAsync_v2(dst, src as *const c_void, bytes, self.stream), "cuMemcpyHtoDAsync")?;
+            Ok(())
+        }
+    }
+
     pub fn kernel(&self, name: &str) -> Result<Kernel> {
         let c = CString::new(name)?;
         let mut f = std::ptr::null_mut();

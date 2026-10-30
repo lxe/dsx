@@ -81,6 +81,19 @@ struct Cli {
     /// text only: don't load the vision weights even if `vision.safetensors` sits next to the model
     #[arg(long)]
     no_vision: bool,
+    /// conversation lineages kept for prefix reuse, including the active one. `1` (default) is the current
+    /// single-lineage behaviour with no host parking; `>1` parks inactive lineages in the host cache so `A -> B -> A`
+    /// resumes instead of prefilling from token 0.
+    #[arg(long, default_value_t = 1)]
+    cache_sessions: usize,
+    /// hard budget for the host cache of inactive lineages, decimal GB (committed arena memory and the logical host
+    /// payload never exceed it). Ignored with `--cache-sessions 1`.
+    #[arg(long, default_value_t = 8.0)]
+    session_cache_gb: f64,
+    /// periodic sparse prefix-anchor interval in prompt tokens (`0` disables anchors): a new agent that shares a
+    /// long system/tools prefix can replay only the divergent tail from an earlier anchor.
+    #[arg(long, default_value_t = 16384)]
+    prefix_anchor_tokens: usize,
 }
 
 #[tokio::main]
@@ -102,6 +115,17 @@ async fn main() -> Result<()> {
     }
     if let Some(v) = &cli.vision {
         tracing::info!("vision: {}", v.display());
+    }
+    if cli.cache_sessions > 1 {
+        tracing::info!(
+            "session cache: {} lineages, {:.1} GB host budget, prefix anchor every {} tokens",
+            cli.cache_sessions,
+            cli.session_cache_gb,
+            cli.prefix_anchor_tokens
+        );
+        if cli.session_cache_gb <= 0.0 {
+            tracing::warn!("session cache: --session-cache-gb 0 makes every lineage uncacheable (cold prefills only)");
+        }
     }
     let tok = Arc::new(match (&cli.tokenizer, &cli.model) {
         (Some(t), _) => Tokenizer::from_file(t).map_err(|e| anyhow!("{}: {e}", t.display()))?,
@@ -152,6 +176,9 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
         arena_gb: cli.arena_gb,
         rank: cli.rank.clone(),
         vision: cli.vision.clone(),
+        cache_sessions: cli.cache_sessions,
+        session_cache_gb: cli.session_cache_gb,
+        prefix_anchor_tokens: cli.prefix_anchor_tokens,
     };
     EngineHandle::spawn(move || dsx::server::real::real_engine(&args))
 }
