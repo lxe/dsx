@@ -1943,6 +1943,12 @@ impl GpuModel<'_> {
         Ok(Snapshot { pos: self.pos, rings, states, counters: self.layers.iter().map(|l| (l.n_comp, l.n_idx)).collect(), engram_len: self.engram_hist.len() })
     }
 
+    /// The logits left by the last decode `step`: next-token logits after the cached generated tail. Prefill writes its
+    /// boundary logits into `PrefillBufs`, so callers must use a saved prompt-boundary checkpoint for that case.
+    pub fn read_logits(&self) -> Result<Vec<f32>> {
+        self.g.download::<f32>(self.logits.ptr, self.m.cfg.vocab)
+    }
+
     pub fn restore(&mut self, s: &Snapshot) -> Result<()> {
         let rb = self.ring_bytes();
         let sb = self.state_bytes();

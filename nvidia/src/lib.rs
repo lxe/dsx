@@ -24,6 +24,7 @@ pub mod topk;
 /// The server (from dsx-core) and the GPU engine behind it.
 pub mod server {
     pub use dsx_core::server::*;
+    pub mod prefix;
     #[cfg(feature = "cuda")]
     pub mod real;
 }
