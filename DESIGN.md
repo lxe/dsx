@@ -74,8 +74,9 @@ arena and repacked on a side stream.
 
 - OpenAI chat completions and responses, Anthropic messages, tool calls, streaming, through DeepSeek's
   `deepseek-recipe` prompt encoding.
-- Prefix reuse: the KV of the last conversation stays on the GPU; a request continues it or rewinds to the snapshot
-  at the end of the previous prompt.
+- Prefix reuse: the KV of the current conversation stays on the GPU. The engine keeps a bounded history of
+  prompt-boundary snapshots and resumes from the newest checkpoint at or before the longest common token prefix;
+  only a prefix shorter than every checkpoint starts a cold prefill. Exact retries reuse checkpoint logits.
 - llama.cpp's web UI is embedded and served at `/`, with the llama.cpp endpoints it expects (`/props`, `/slots`) and
   a `timings` chunk at the end of streamed responses.
 - Optional `--api-key`: one shared key, checked before every route that runs the model, in `Authorization: Bearer`

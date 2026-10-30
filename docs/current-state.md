@@ -138,7 +138,10 @@ by individual kernel isolation. It requires a coordinated hardware window; the s
 stop the server and should not be launched as unattended cleanup.
 
 Subsequent proposals include profiling the adaptive-cache scan, combining T16 gate/up launch work and improving
-multi-conversation prefix reuse. Lower-bit dense weights are estimates, not implemented gains. Requantization is
+multi-conversation prefix reuse. Within one conversation the server now keeps a bounded history of prompt-boundary
+KV snapshots (8) and rewinds to the newest checkpoint at or before the longest common prefix, so tool calls and
+retries avoid a full 200K+ token re-prefill. That is intra-conversation recovery, not a multi-conversation cache;
+the latter remains a proposal. Lower-bit dense weights are estimates, not implemented gains. Requantization is
 not currently scheduled. The gpu-unlock proposal was dropped. Old budget tables retain those proposals to explain
 their assumptions, not to designate current jobs.
 
