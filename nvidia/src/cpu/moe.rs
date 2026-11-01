@@ -671,6 +671,8 @@ mod tests {
         use GType::*;
         [
             (Q2_0, Q3K),
+            (Iq1S, Q2K),
+            (Iq2S, Iq3Xxs),
             (Ptq1_0, Q2_0),
             (Q3K, Ptq1_0),
             (Q2_0, Q2_0),

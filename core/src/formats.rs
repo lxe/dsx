@@ -73,6 +73,34 @@ pub fn dequant_row(t: GType, raw: &[u8], out: &mut [f32]) {
                 }
             }
         }
+        GType::Q2K => {
+            for (b, blk) in raw.chunks_exact(84).enumerate() {
+                let (d, dm) = (f16_at(blk, 80), f16_at(blk, 82));
+                for e in 0..256 {
+                    let sc = blk[e / 16];
+                    let q = (blk[16 + (e / 128) * 32 + e % 32] >> (2 * ((e / 32) % 4))) & 3;
+                    out[b * 256 + e] = (d * (sc & 15) as f32) * q as f32 - dm * (sc >> 4) as f32;
+                }
+            }
+        }
+        GType::Iq3Xxs => {
+            use crate::iqgrid::{IQ3XXS_GRID, KSIGNS_IQ2XS};
+            for (b, blk) in raw.chunks_exact(98).enumerate() {
+                let d = f16_at(blk, 0);
+                for ib in 0..8 {
+                    let sg = u32::from_le_bytes(blk[66 + 4 * ib..70 + 4 * ib].try_into().unwrap());
+                    let db = d * (0.5 + (sg >> 28) as f32) * 0.5;
+                    for q in 0..8 {
+                        let grid = IQ3XXS_GRID[blk[2 + 8 * ib + q] as usize].to_le_bytes();
+                        let signs = KSIGNS_IQ2XS[((sg >> (7 * (q / 2))) & 127) as usize];
+                        for j in 0..4 {
+                            let v = db * grid[j] as f32;
+                            out[b * 256 + ib * 32 + q * 4 + j] = if (signs >> (4 * (q % 2) + j)) & 1 != 0 { -v } else { v };
+                        }
+                    }
+                }
+            }
+        }
         GType::Q3K => {
             for (b, blk) in raw.chunks_exact(110).enumerate() {
                 let (hm, qs, raw12) = (&blk[0..32], &blk[32..96], &blk[96..108]);

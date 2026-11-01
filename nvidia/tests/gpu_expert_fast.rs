@@ -21,12 +21,15 @@ fn random_rows(ty: GType, rows: usize, cols: usize, seed: &mut u64) -> Vec<u8> {
         GType::Q8_0 | GType::Q2_0 | GType::Iq2Xxs | GType::Iq1S | GType::Iq2Xs | GType::Iq2S => 0,
         GType::Ptq1_0 => 26,
         GType::Q3K => 108,
+        GType::Q2K => 80,
+        GType::Iq3Xxs => 0,
         _ => unreachable!(),
     };
     let scale = if ty == GType::Q8_0 { 1e-3 } else { 0.01 };
     for blk in 0..nb {
         let s = half::f16::from_f32(scale * (1.0 + (rng(seed) % 100) as f32 * 0.01)).to_le_bytes();
         v[blk * b + at..blk * b + at + 2].copy_from_slice(&s);
+        if ty == GType::Q2K { v[blk*b+82..blk*b+84].copy_from_slice(&half::f16::from_f32(0.003).to_le_bytes()); }
     }
     v
 }
@@ -80,7 +83,7 @@ fn quant(g: &Gpu, x: u64, k: usize, nvec: usize) -> QBufs {
 fn fast_gemv_matches_cpu() {
     let g = Gpu::new(0).unwrap();
     let mut seed = 0x1234_5678_9abc_def0u64;
-    for ty in [GType::Q8_0, GType::Q2_0, GType::Ptq1_0, GType::Q3K, GType::Iq2Xxs, GType::Iq1S, GType::Iq2Xs, GType::Iq2S] {
+    for ty in [GType::Q2K, GType::Iq3Xxs, GType::Q8_0, GType::Q2_0, GType::Ptq1_0, GType::Q3K, GType::Iq2Xxs, GType::Iq1S, GType::Iq2Xs, GType::Iq2S] {
         for (rows, k) in [(200usize, 5120usize), (136, 2304)] {
             let w = random_rows(ty, rows, k, &mut seed);
             let rb = ty.row_bytes(k);
@@ -254,7 +257,7 @@ fn moe_fast_iq_matches_cpu() {
     let g = Gpu::new(0).unwrap();
     let mut seed = 0x51ed_270b_27b9_d1a3u64;
     let c = ExpCfg { n_layers: 2, n_experts: 14, inter: 2304, dim: 5120, lim: 10.0, rot: 0 };
-    let kinds = [(GType::Iq1S, GType::Iq2Xxs), (GType::Iq2Xxs, GType::Iq2S), (GType::Iq2Xs, GType::Iq2Xs), (GType::Iq1S, GType::Q2_0), (GType::Ptq1_0, GType::Iq2S)];
+    let kinds = [(GType::Iq1S, GType::Q2K), (GType::Iq2S, GType::Iq3Xxs), (GType::Iq3Xxs, GType::Q2K), (GType::Iq1S, GType::Iq2Xxs), (GType::Iq2Xxs, GType::Iq2S), (GType::Iq2Xs, GType::Iq2Xs), (GType::Iq1S, GType::Q2_0), (GType::Ptq1_0, GType::Iq2S)];
     let mats: Vec<(GType, GType, Vec<u8>, Vec<u8>, Vec<u8>)> = (0..10)
         .map(|e| {
             let (gu, dn) = kinds[e % kinds.len()];
