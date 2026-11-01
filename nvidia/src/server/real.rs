@@ -304,7 +304,6 @@ impl Real {
                 }
             }
         }
-        let _ = Duration::ZERO;
         Ok(fin)
     }
 
