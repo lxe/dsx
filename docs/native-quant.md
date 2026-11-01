@@ -89,8 +89,15 @@ CPU information and exact commit IDs. Do not compare to upstream main, which
 has no Q2_K/IQ3_XXS CPU kernels. Measure full-model decode and prompt processing
 separately; this benchmark does not predict a tokens/s improvement.
 
-## Validation status for this submission
+## Full-model validation
 
-See the PR description for commands actually run. GPU execution and full-model
-quality/performance after rebasing require hardware validation. Historical
-workstation runs are not a substitute for validating this exact revision.
+Unsloth's DeepSeek-V4.1-Flash-1017 UD-IQ2_XXS export (six shards; its expert tensors include Q2_K and IQ3_XXS)
+on 2x RTX 3090 with a 64-core EPYC host, `--arena-gb 200`, 32K context:
+
+| Check | Result |
+|---|---|
+| `gpu_expert_fast` with Q2_K / IQ3_XXS (GPU vs CPU reference) | pass |
+| Load the export | loads; current main stops at `unsupported ggml type 10` |
+| Greedy chat (1.7K-token prompt, then a follow-up) | coherent output |
+| Prefill, 9.9K-token prompt | 869 tok/s |
+| Decode after that prompt | 25.2 tok/s |

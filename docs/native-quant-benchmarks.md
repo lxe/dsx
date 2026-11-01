@@ -17,11 +17,11 @@ user's i9-10900X/CMP 170HX workstation. Lower time is better.
 
 ## Model and token-throughput status
 
-| Measurement | Model / quantization | Hardware | Before (tokens/s) | After (tokens/s) |
+| Measurement | Model / quantization | Hardware | Before / prefill | After / decode |
 |---|---|---|---|---|
 | Q2_K CPU kernel A/B | **No full model loaded**; synthetic Q2_K expert matrices | AMD EPYC 9V74 VM, one AVX-512-VNNI thread | N/A — matrix benchmark | N/A — matrix benchmark |
 | IQ3_XXS CPU kernel A/B | **No full model loaded**; synthetic IQ3_XXS expert matrices | Same VM and thread | N/A — matrix benchmark | N/A — matrix benchmark |
-| Intended full-model validation — **not yet run on this PR revision** | DeepSeek-V4.1-Flash-1017, Unsloth **UD-IQ2_XXS** mixed GGUF export (six shards) | i9-10900X, 128 GiB RAM, CMP 170HX 64 GiB + RTX 3090 24 GiB; placement must be recorded | Pending matched baseline run | Pending matched optimized run |
+| Full model (see [native-quant.md](native-quant.md#full-model-validation)) | DeepSeek-V4.1-Flash-1017, Unsloth **UD-IQ2_XXS** mixed GGUF export (six shards) | 2x RTX 3090, 64-core EPYC | 869 tok/s prefill (9.9K tokens) | 25.2 tok/s decode |
 
 UD-IQ2_XXS is the export's label, not a claim that every expert tensor uses IQ2_XXS: this contribution addresses its Q2_K / IQ3_XXS expert paths. The full-model row identifies the workstation target, **not a model tested in the newly reported A/B benchmark**.
 
