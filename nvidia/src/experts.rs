@@ -230,9 +230,10 @@ impl T16Bufs {
     }
 }
 
-/// k-splits of the T16 GEMVs: gate / up (dim / 256 = 20 groups), down (inter / 256 = 9 groups)
-const T16_SGU: usize = 4;
-const T16_SD: usize = 3;
+/// k-splits of the T16 GEMVs: gate / up (dim / 256 = 20 groups), down (inter / 256 = 9 groups); the decode-path
+/// harnesses (src/bin/t16-decode-*.rs) link these so their launches cannot drift from the engine's split counts
+pub const T16_SGU: usize = 4;
+pub const T16_SD: usize = 3;
 
 /// Type id of `t` repacked for the fast kernels (expert_fast.cuh), the same bytes per weight.
 pub fn repacked_id(t: GType) -> Result<i32> {
@@ -684,8 +685,9 @@ impl GpuExperts {
         let (tab, base, e) = (Arg::P(self.tab.ptr), Arg::P(self.buf.ptr), Arg::I(self.n_experts as i32));
         let (li, ki, ti) = (Arg::I(l as i32), Arg::I(k as i32), Arg::I(t as i32));
         let blocks = |warps: usize| ((warps as u32).div_ceil(4), 1, 1);
-        // DSX_T16_GEMV=0: the GEMV before cp.async staging (same launch and output bits; for A/Bs)
-        let old = std::env::var("DSX_T16_GEMV").is_ok_and(|v| v == "0");
+        // DSX_T16_GEMV=0: the GEMV before cp.async staging (same launch and output bits; for A/Bs). SM70 has no
+        // cp.async: there the plain kernel is picked by the device arch at run time (the env still overrides).
+        let old = g.is_pre_sm80() || std::env::var("DSX_T16_GEMV").is_ok_and(|v| v == "0");
         let gemv = |k2: usize| self.k[if old { ["t16d_gemv0_3", "t16d_gemv0_4", "t16d_gemv0_5"] } else { ["t16d_gemv_3", "t16d_gemv_4", "t16d_gemv_5"] }[k2 - 3]];
         for (role, xp, xd, xs) in [(0, b.xpg, b.xdg, b.xsg), (1, b.xpu, b.xdu, b.xsu)] {
             g.launch(self.k["t16d_prep"], blocks(picks * dim / 256), 128, 0, &[Arg::P(x), Arg::I(0), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(role), Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(kg as i32), Arg::P(xp), Arg::P(xd), Arg::P(xs)])?;

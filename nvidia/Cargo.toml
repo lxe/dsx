@@ -41,6 +41,16 @@ path = "src/bin/t16-prefill-audit.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "t16-decode-check"
+path = "src/bin/t16-decode-check.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "t16-decode-probe"
+path = "src/bin/t16-decode-probe.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "prefill-bench"
 path = "src/bin/prefill-bench.rs"
 required-features = ["cuda"]

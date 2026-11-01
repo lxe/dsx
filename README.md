@@ -32,7 +32,21 @@ hf download lxe/DeepSeek-V4.1-Flash-1017-dsx-t16 --local-dir dsx-t16
 CUDA_ARCHS=86 cargo build --release -p dsx --features cuda
 ```
 
-Use `CUDA_ARCHS=89` for an RTX 4090 or `120` for an RTX 5090. Start the server:
+Use `CUDA_ARCHS=89` for an RTX 4090 or `120` for an RTX 5090. **`CUDA_ARCHS=70` runs on Tesla V100 (Volta) — see [Tesla V100](#tesla-v100-sm70).**
+
+### Tesla V100 (SM70)
+
+`CUDA_ARCHS=70` (with CUDA 12.9) builds for Volta: every SM80-only kernel has an SM70 twin, and SM80+ binaries are
+unchanged. Measured on 2x V100-PCIE-32GB with 108 GB of RAM: 21-23 tokens/s decode and 467 tokens/s prefill on a
+123K-token prompt. Details and checks: [bench/results/2026-11-01-volta](bench/results/2026-11-01-volta/README.md).
+
+```bash
+CUDA_ARCHS=70 cargo build --release -p dsx --features cuda
+DSX_GPUS=0,1 ./target/release/dsx-server --model dsx-t16/DeepSeek-V4.1-Flash-1017-dsx-t16.gguf \
+  --rank dsx-t16/expert-rank.json --main-gb=-2.0 --arena-gb 85 --ctx 131072
+```
+
+Start the server:
 
 ```bash
 ./target/release/dsx-server \
