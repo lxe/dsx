@@ -123,6 +123,21 @@ async fn main() -> Result<()> {
             cli.session_cache_gb,
             cli.prefix_anchor_tokens
         );
+        // the cache's pinned slabs come on top of the expert arena: refuse a budget that cannot fit next to it
+        let avail_gb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
+            .map(|kb| kb / 1e6);
+        if let Some(avail) = avail_gb {
+            let need = cli.arena_gb + cli.session_cache_gb + 8.0;
+            if need > avail {
+                return Err(anyhow!(
+                    "--arena-gb {} + --session-cache-gb {} + 8 GB headroom = {need:.0} GB exceeds the {avail:.0} GB of available RAM",
+                    cli.arena_gb,
+                    cli.session_cache_gb
+                ));
+            }
+        }
         if cli.session_cache_gb <= 0.0 {
             tracing::warn!("session cache: --session-cache-gb 0 makes every lineage uncacheable (cold prefills only)");
         }

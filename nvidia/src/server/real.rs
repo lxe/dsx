@@ -280,6 +280,13 @@ impl Real {
         // Take the manager out so the GPU model and the cache can be borrowed independently.
         let mut cache = self.multi.take().expect("multi cache");
         let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, prompt, p, emit);
+        if r.is_err() {
+            // the device state and the active lineage's `cached` tokens may disagree after a failed prefill or rewind:
+            // forget that lineage so the next request restores a parked session or prefills cold
+            if let Some(id) = cache.active {
+                cache.drop_session(id);
+            }
+        }
         self.multi = Some(cache);
         let (fin, stats) = r?;
         self.stats = stats;
@@ -536,7 +543,7 @@ fn multi_request(
     let mutated = matches!(class, RequestClass::Mutate);
 
     if class == RequestClass::Mutate {
-        let target = source_id.expect("mutate without a session");
+        let target = source_id.ok_or_else(|| anyhow::anyhow!("session cache: mutate without a session"))?;
         let target_active = cache.active == Some(target);
         if !target_active {
             // switch: park the current active lineage, then restore the target's full backing state
@@ -544,7 +551,7 @@ fn multi_request(
             let (pb, pm) = park_active(gm, cache, &keep, 0);
             park_bytes = pb;
             park_ms = pm;
-            let idx = cache.session_index(target).expect("mutate target survives admission");
+            let idx = cache.session_index(target).ok_or_else(|| anyhow::anyhow!("session cache: mutate target survives admission"))?;
             let parked = cache.sessions[idx].parked.take();
             match parked {
                 Some(ps) => {
@@ -577,7 +584,7 @@ fn multi_request(
                 }
             }
         }
-        let idx = cache.session_index(target).expect("mutate target exists");
+        let idx = cache.session_index(target).ok_or_else(|| anyhow::anyhow!("session cache: mutate target exists"))?;
         // rewind to the selected checkpoint/anchor (the live state needs no rewind)
         match state_kind {
             StateKind::PromptCheckpoint => {
@@ -615,7 +622,7 @@ fn multi_request(
         invalidated = cache.invalidate_after(idx, raw_lcp);
         session_id = Some(target);
     } else if class == RequestClass::NewFromPrefix {
-        let source = source_id.expect("prefix source");
+        let source = source_id.ok_or_else(|| anyhow::anyhow!("session cache: prefix source"))?;
         let source_was_active = cache.active == Some(source);
         if cache.active.is_some() {
             let keep: Vec<SessionId> = if cache.active == Some(source) { vec![] } else { vec![source] };
@@ -744,7 +751,7 @@ fn multi_request(
     // ---- session entry: mutate the existing lineage, or start a new one ----
     if let Some(sid) = session_id {
         if mutated {
-            let idx = cache.session_index(sid).expect("mutated session exists");
+            let idx = cache.session_index(sid).ok_or_else(|| anyhow::anyhow!("session cache: mutated session exists"))?;
             for (pos, st) in anchors.drain(..) {
                 cache.push_anchor(idx, PrefixAnchor { pos, state: st });
             }
@@ -766,7 +773,7 @@ fn multi_request(
             session_id = None;
         } else {
             let sid = cache.create_session(key.clone(), gm.pos);
-            let idx = cache.session_index(sid).expect("new session");
+            let idx = cache.session_index(sid).ok_or_else(|| anyhow::anyhow!("session cache: new session"))?;
             for (pos, st) in anchors.drain(..) {
                 cache.push_anchor(idx, PrefixAnchor { pos, state: st });
             }
@@ -789,7 +796,7 @@ fn multi_request(
         } else if !duplicate_boundary {
             match gm.capture_rewind(&mut cache.arena) {
                 Ok(state) => {
-                    let idx = cache.session_index(sid).expect("session for checkpoint");
+                    let idx = cache.session_index(sid).ok_or_else(|| anyhow::anyhow!("session cache: session for checkpoint"))?;
                     cache.push_checkpoint(idx, PromptCheckpoint { pos: prompt.len(), logits: logits.clone(), state });
                 }
                 Err(e) => {
