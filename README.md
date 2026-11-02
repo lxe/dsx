@@ -139,6 +139,7 @@ needs prefill. [DESIGN.md](DESIGN.md) describes the execution and memory layout.
 | [Coding agents](docs/agents.md) | Pi provider configuration |
 | [Expert placement](docs/placement.md) | GPU, RAM and disk placement; tuning for your machine |
 | [T16 format](docs/t16-format.md) | Quantization and CPU/GPU decoding |
+| [Overlays](docs/overlays.md) | Small GGUFs that replace a few tensors at load, such as the uncensored overlay |
 | [NVIDIA runner](nvidia/README.md) | CLI tools, build details and debugging |
 | [AMD runner](amd/README.md) | The separate MI325X implementation and model |
 | [Measurements](docs/current-state.md) | Current runtime status, quality evidence and benchmark history |

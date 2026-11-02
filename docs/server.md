@@ -10,6 +10,7 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 | `--model` | the model GGUF; for a model in shards, the first one (the others load from beside it) |
 | `--engram` | directory with the official checkpoint's Engram shards (`model-00047/00048-of-00048.safetensors`), or a GGUF holding the table; default: the table in the model GGUF |
 | `--tokenizer` | the official `tokenizer.json`; default: the one stored in the model GGUF |
+| `--overlay` | a GGUF of replacement tensors laid over the model's, such as an [uncensored overlay](overlays.md) (env `DSX_OVERLAY`) |
 | `--rank` | expert hotness order (`expert-rank.json` in the quant repo) |
 | `--vision` / `--no-vision` | image input (default: `vision.safetensors` beside the model); `--no-vision` for text only |
 
