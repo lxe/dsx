@@ -40,6 +40,8 @@ use crate::model::Model;
 pub struct RealEngineArgs {
     pub model: PathBuf,
     pub engram: Option<PathBuf>,
+    /// a GGUF of replacement tensors laid over the model's (`Gguf::overlay`)
+    pub overlay: Option<PathBuf>,
     pub ctx: usize,
     pub chunk: usize,
     pub gpu0_gb: f64,
@@ -103,13 +105,13 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
     let m: &'static Model = Box::leak(Box::new(if args.model.is_dir() {
         Model::load_hf(&args.model)?
     } else {
-        Model::load(&args.model, args.engram.as_deref())?
+        Model::load(&args.model, args.engram.as_deref(), args.overlay.as_deref())?
     }));
     let pl = Placement { gpu0_gb: args.gpu0_gb, aux_gb: args.gpu1_gb, arena_gb: args.arena_gb, prefill_chunk: args.chunk, rank: args.rank.clone() };
     let vision = args.vision.as_deref().map(VisionWeights::load).transpose()?;
     let gm = GpuModel::with_placement(m, -1, args.ctx, pl)?;
     let multi = if args.cache_sessions > 1 {
-        let fingerprint = CacheContextFingerprint::build(&args.model, args.vision.as_deref(), &m.cfg, m.engram.is_some());
+        let fingerprint = CacheContextFingerprint::build(&args.model, args.overlay.as_deref(), args.vision.as_deref(), &m.cfg, m.engram.is_some());
         let budget = (args.session_cache_gb.max(0.0) * 1e9) as usize;
         let anchors = if args.prefix_anchor_tokens == 0 { 0 } else { args.prefix_anchor_tokens };
         tracing::info!(

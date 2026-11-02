@@ -43,6 +43,7 @@ impl CacheContextFingerprint {
     /// model variants: add another identity field and compare it in the same place.
     pub fn build(
         model_path: &Path,
+        overlay_path: Option<&Path>,
         vision_path: Option<&Path>,
         cfg: &Config,
         has_engram: bool,
@@ -50,6 +51,10 @@ impl CacheContextFingerprint {
         let mut model = fnv(b"dsx-model-v1");
         fnv_bytes(&mut model, model_path.to_string_lossy().as_bytes());
         file_identity(&mut model, model_path);
+        if let Some(o) = overlay_path {
+            fnv_bytes(&mut model, o.to_string_lossy().as_bytes());
+            file_identity(&mut model, o);
+        }
         fnv_usize(&mut model, cfg.vocab);
         fnv_usize(&mut model, cfg.dim);
         fnv_usize(&mut model, cfg.inter);

@@ -61,6 +61,9 @@ struct Cli {
     model: Option<PathBuf>,
     #[arg(long)]
     engram: Option<PathBuf>,
+    /// a GGUF of replacement tensors laid over the model's, e.g. an abliterated build's few edited matrices
+    #[arg(long, env = "DSX_OVERLAY")]
+    overlay: Option<PathBuf>,
     #[arg(long, default_value_t = 4096)]
     chunk: usize,
     /// GB of routed experts on the main GPU (picked by host-link bandwidth); negative = its free memory minus that
@@ -184,6 +187,7 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
     let args = dsx::server::real::RealEngineArgs {
         model: cli.model.clone().ok_or_else(|| anyhow!("--model is required (or --mock)"))?,
         engram: cli.engram.clone(),
+        overlay: cli.overlay.clone(),
         ctx: cli.ctx,
         chunk: cli.chunk,
         gpu0_gb: cli.gpu0_gb,

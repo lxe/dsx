@@ -562,8 +562,13 @@ fn ropes(cfg: &Config) -> (Rope, Rope) {
 
 impl Model {
     /// A GGUF export (dense Q8_0/F16/F32, routed experts Q2_0/PTQ1_0/Q3_K); Engram rows from the HF checkpoint dir.
-    pub fn load(gguf: &Path, engram_dir: Option<&Path>) -> Result<Model> {
-        let g = Gguf::open(gguf)?;
+    /// `overlay`: a GGUF of replacement tensors laid over the model's (`Gguf::overlay`).
+    pub fn load(gguf: &Path, engram_dir: Option<&Path>, overlay: Option<&Path>) -> Result<Model> {
+        let mut g = Gguf::open(gguf)?;
+        if let Some(o) = overlay {
+            let n = g.overlay(o)?;
+            eprintln!("overlay: {n} tensors from {}", o.display());
+        }
         let cfg = Config::from_gguf(&g)?;
         let m = |n: &str| -> Result<Mat> { Ok(Mat::from_gguf(&g, g.get(n)?)) };
         let om = |n: &str| -> Option<Mat> { g.tensors.get(n).map(|t| Mat::from_gguf(&g, t)) };

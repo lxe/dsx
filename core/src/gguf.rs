@@ -306,6 +306,32 @@ impl Gguf {
         Ok(g)
     }
 
+    /// Replace tensors with the same-named ones in `path`, a GGUF that holds only them (a weight edit of a few
+    /// matrices, e.g. an abliteration of the dense output projections). Each must exist here with the same dims and
+    /// type, so loaders and kernels see the layout they expect; its file is mapped as one more shard. A
+    /// `dsx.overlay.base` key, when present, must match this model's `general.name`. Returns the number replaced.
+    pub fn overlay(&mut self, path: &Path) -> Result<usize> {
+        let o = Gguf::open(path)?;
+        let base = self.kv.get("general.name").and_then(|v| v.as_str());
+        if let (Some(want), Some(have)) = (o.kv.get("dsx.overlay.base").and_then(|v| v.as_str()), base) {
+            if want != have {
+                bail!("{} is an overlay for {want}, not {have}", path.display());
+            }
+        }
+        let shard0 = self.maps.len();
+        for name in &o.order {
+            let t = &o.tensors[name];
+            let b = self.get(name).with_context(|| format!("overlay {}", path.display()))?;
+            if b.dims != t.dims || b.ty != t.ty {
+                bail!("overlay {name}: {:?} {:?}, the model has {:?} {:?}", t.ty, t.dims, b.ty, b.dims);
+            }
+            self.tensors.insert(name.clone(), TensorInfo { shard: shard0 + t.shard, ..t.clone() });
+        }
+        self.paths.extend(o.paths);
+        self.maps.extend(o.maps);
+        Ok(o.order.len())
+    }
+
     pub fn get(&self, name: &str) -> Result<&TensorInfo> {
         self.tensors.get(name).with_context(|| format!("tensor {name} not in the model"))
     }
@@ -560,6 +586,73 @@ mod split_tests {
         assert_eq!(g.arr_u64("dsx.expert_rot").unwrap(), rot.iter().map(|&v| v as u64).collect::<Vec<_>>());
         for f in p {
             std::fs::remove_file(f).ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use std::path::PathBuf;
+
+    /// A minimal GGUF v3: `general.name` when given, then F32 tensors (name, dims, values).
+    fn write(name: &str, model: Option<&str>, base: Option<&str>, tensors: &[(&str, Vec<u64>, Vec<f32>)]) -> PathBuf {
+        let s = |h: &mut Vec<u8>, x: &str| {
+            h.extend((x.len() as u64).to_le_bytes());
+            h.extend(x.as_bytes());
+        };
+        let kvs: Vec<(&str, &str)> = [("general.name", model), ("dsx.overlay.base", base)].into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+        let mut h = b"GGUF".to_vec();
+        h.extend(3u32.to_le_bytes());
+        h.extend((tensors.len() as u64).to_le_bytes());
+        h.extend((kvs.len() as u64).to_le_bytes());
+        for (k, v) in &kvs {
+            s(&mut h, k);
+            h.extend(8u32.to_le_bytes());
+            s(&mut h, v);
+        }
+        let mut off = 0u64;
+        for (n, dims, v) in tensors {
+            s(&mut h, n);
+            h.extend((dims.len() as u32).to_le_bytes());
+            for d in dims {
+                h.extend(d.to_le_bytes());
+            }
+            h.extend(0u32.to_le_bytes());
+            h.extend(off.to_le_bytes());
+            off += (v.len() as u64 * 4).div_ceil(32) * 32;
+        }
+        h.resize(h.len().div_ceil(32) * 32, 0);
+        for (_, _, v) in tensors {
+            let start = h.len();
+            v.iter().for_each(|x| h.extend(x.to_le_bytes()));
+            h.resize(start + (v.len() * 4).div_ceil(32) * 32, 0);
+        }
+        let p = std::env::temp_dir().join(format!("dsx_overlay_test_{}_{name}.gguf", std::process::id()));
+        std::fs::write(&p, h).unwrap();
+        p
+    }
+
+    fn f32s(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn replaces_named_tensors_and_checks_shapes() {
+        let base = write("base", Some("m"), None, &[("a", vec![2, 2], vec![1.; 4]), ("b", vec![4], vec![2.; 4])]);
+        let over = write("over", None, Some("m"), &[("b", vec![4], vec![7., 8., 9., 10.])]);
+        let mut g = super::Gguf::open(&base).unwrap();
+        assert_eq!(g.overlay(&over).unwrap(), 1);
+        assert_eq!(f32s(g.bytes(g.get("a").unwrap())), vec![1.; 4]);
+        assert_eq!(f32s(g.bytes(g.get("b").unwrap())), vec![7., 8., 9., 10.]);
+
+        let shape = write("shape", None, None, &[("b", vec![2, 2], vec![0.; 4])]);
+        assert!(super::Gguf::open(&base).unwrap().overlay(&shape).is_err());
+        let missing = write("missing", None, None, &[("c", vec![4], vec![0.; 4])]);
+        assert!(super::Gguf::open(&base).unwrap().overlay(&missing).is_err());
+        let other = write("other", None, Some("n"), &[("b", vec![4], vec![0.; 4])]);
+        assert!(super::Gguf::open(&base).unwrap().overlay(&other).is_err());
+        for p in [base, over, shape, missing, other] {
+            std::fs::remove_file(p).ok();
         }
     }
 }

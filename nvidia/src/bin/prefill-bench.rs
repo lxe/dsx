@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         !ids.is_empty() && ids.len() < a.ctx,
         "prompt must fit context"
     );
-    let m = Model::load(&a.model, None)?;
+    let m = Model::load(&a.model, None, None)?;
     let mut gm = GpuModel::with_placement(
         &m,
         -1,

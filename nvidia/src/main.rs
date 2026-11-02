@@ -218,8 +218,10 @@ fn top(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     v
 }
 
+/// DSX_OVERLAY: a GGUF of replacement tensors over the model's (the server's --overlay)
 fn load(p: &std::path::Path, engram: Option<&std::path::Path>) -> Result<Model> {
-    if p.is_dir() { Model::load_hf(p) } else { Model::load(p, engram) }
+    let overlay = std::env::var_os("DSX_OVERLAY").map(std::path::PathBuf::from);
+    if p.is_dir() { Model::load_hf(p) } else { Model::load(p, engram, overlay.as_deref()) }
 }
 
 fn main() -> Result<()> {
