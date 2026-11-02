@@ -6,7 +6,7 @@ use crate::gpu::{Arg, Buf, Gpu, Kernel};
 use crate::hostcache::{Extent, HostCacheArena};
 use crate::model::{Mat, Model, dot, matvec};
 use crate::numerics::{round_bf16, silu};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 mod prefill;
 mod vision;
@@ -599,7 +599,8 @@ impl<'m> GpuModel<'m> {
         let rank: Option<Vec<(usize, usize)>> = match &pl.rank {
             None => None,
             Some(p) => {
-                let v: Vec<(usize, usize, u64)> = serde_json::from_slice(&std::fs::read(p)?)?;
+                let v: Vec<(usize, usize, u64)> = serde_json::from_slice(&std::fs::read(p).with_context(|| format!("--rank {}", p.display()))?)
+                    .with_context(|| format!("--rank {}", p.display()))?;
                 prior = v.clone();
                 let mut seen = std::collections::HashSet::new();
                 let mut r: Vec<(usize, usize)> = v.into_iter().map(|(l, e, _)| (l, e)).filter(|x| seen.insert(*x)).collect();
