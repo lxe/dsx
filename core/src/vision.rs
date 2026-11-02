@@ -15,7 +15,9 @@ use base64::Engine as _;
 
 pub const PATCH: usize = 14;
 pub const DOWNSAMPLE: usize = 3;
+/// the reference's `vision_max_n_token`: the most LLM tokens one image may cost (default of [`set_max_tokens`])
 pub const MAX_TOKENS: usize = 1024;
+static MAX_TOKENS_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_TOKENS);
 pub const MIN_PIXELS: usize = 544 * 544;
 /// `<｜image｜>`: the prompt placeholder, and the id every position of an image span carries
 pub const IMAGE_TOKEN_ID: u32 = 129264;
@@ -51,6 +53,17 @@ impl ImageInput {
     }
 }
 
+/// Per-image token cap for [`load`] (`dsx-server --vision-max-tokens`). Values above [`MAX_TOKENS`] give the ViT
+/// larger grids than DeepSeek's config allows; the model may not have been trained on them.
+pub fn set_max_tokens(n: usize) {
+    assert!(n >= 4, "vision max tokens {n}: an image needs at least 4");
+    MAX_TOKENS_NOW.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn max_tokens() -> usize {
+    MAX_TOKENS_NOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn num_image_tokens(n_llm_h: usize, n_llm_w: usize) -> usize {
     n_llm_h * (n_llm_w + 1) + 2
 }
@@ -59,16 +72,16 @@ fn llm_grid(best_h: usize, best_w: usize) -> (usize, usize) {
     ((best_h / PATCH).div_ceil(DOWNSAMPLE), (best_w / PATCH).div_ceil(DOWNSAMPLE))
 }
 
-fn solve_resize_ratio(height: f64, width: f64) -> (usize, usize) {
+fn solve_resize_ratio(height: f64, width: f64, max_tokens: usize) -> (usize, usize) {
     let r = height / width;
-    let max_w = ((MAX_TOKENS - 2) as f64 / r + 0.25).sqrt() - 0.5;
+    let max_w = ((max_tokens - 2) as f64 / r + 0.25).sqrt() - 0.5;
     let max_h = max_w * r;
     let cell = PATCH * DOWNSAMPLE;
     if max_w < 1.0 {
-        return ((MAX_TOKENS - 2) / 2 * cell, cell);
+        return ((max_tokens - 2) / 2 * cell, cell);
     }
     if max_h < 1.0 {
-        return (cell, (MAX_TOKENS - 3) * cell);
+        return (cell, (max_tokens - 3) * cell);
     }
     let beta = (max_w.floor() * cell as f64 / width).min(max_h.floor() * cell as f64 / height);
     (((height * beta) / PATCH as f64).floor() as usize * PATCH, ((width * beta) / PATCH as f64).floor() as usize * PATCH)
@@ -76,6 +89,10 @@ fn solve_resize_ratio(height: f64, width: f64) -> (usize, usize) {
 
 /// (n_llm_h, n_llm_w, best_height, best_width) for an image of this size: `plan_image_grid` in the reference
 pub fn plan_grid(width: usize, height: usize) -> (usize, usize, usize, usize) {
+    plan_grid_max(width, height, max_tokens())
+}
+
+fn plan_grid_max(width: usize, height: usize, max_tokens: usize) -> (usize, usize, usize, usize) {
     let (mut w, mut h) = (width as f64, height as f64);
     if w * h > 0.0 && w * h < MIN_PIXELS as f64 {
         let ratio = (MIN_PIXELS as f64 / (w * h)).sqrt();
@@ -84,10 +101,10 @@ pub fn plan_grid(width: usize, height: usize) -> (usize, usize, usize, usize) {
     }
     let (mut best_w, mut best_h) = ((w / PATCH as f64).ceil() as usize * PATCH, (h / PATCH as f64).ceil() as usize * PATCH);
     let (mut lh, mut lw) = llm_grid(best_h, best_w);
-    if num_image_tokens(lh, lw) > MAX_TOKENS {
-        (best_h, best_w) = solve_resize_ratio(h, w);
+    if num_image_tokens(lh, lw) > max_tokens {
+        (best_h, best_w) = solve_resize_ratio(h, w, max_tokens);
         (lh, lw) = llm_grid(best_h, best_w);
-        assert!(num_image_tokens(lh, lw) <= MAX_TOKENS);
+        assert!(num_image_tokens(lh, lw) <= max_tokens);
     }
     (lh, lw, best_h, best_w)
 }
@@ -298,15 +315,25 @@ mod tests {
     #[test]
     fn grid_matches_reference() {
         // values from the reference plan_image_grid (fp8-1017/inference/image_processor.py)
-        assert_eq!(plan_grid(640, 480), (12, 16, 490, 644));
-        assert_eq!(plan_grid(100, 100), (13, 13, 546, 546));
-        assert_eq!(plan_grid(4000, 3000), (27, 36, 1134, 1512));
-        assert_eq!(plan_grid(4000, 100), (3, 96, 112, 4004));
-        assert_eq!(plan_grid(100, 4000), (96, 3, 4004, 112));
-        assert_eq!(plan_grid(1920, 1080), (23, 41, 966, 1708));
-        assert_eq!(plan_grid(544, 544), (13, 13, 546, 546));
-        assert_eq!(plan_grid(1, 1), (13, 13, 546, 546));
+        assert_eq!(plan_grid_max(640, 480, MAX_TOKENS), (12, 16, 490, 644));
+        assert_eq!(plan_grid_max(100, 100, MAX_TOKENS), (13, 13, 546, 546));
+        assert_eq!(plan_grid_max(4000, 3000, MAX_TOKENS), (27, 36, 1134, 1512));
+        assert_eq!(plan_grid_max(4000, 100, MAX_TOKENS), (3, 96, 112, 4004));
+        assert_eq!(plan_grid_max(100, 4000, MAX_TOKENS), (96, 3, 4004, 112));
+        assert_eq!(plan_grid_max(1920, 1080, MAX_TOKENS), (23, 41, 966, 1708));
+        assert_eq!(plan_grid_max(544, 544, MAX_TOKENS), (13, 13, 546, 546));
+        assert_eq!(plan_grid_max(1, 1, MAX_TOKENS), (13, 13, 546, 546));
         assert_eq!(num_image_tokens(14, 18), 14 * 19 + 2);
+    }
+
+    #[test]
+    fn grid_respects_max_tokens() {
+        for (w, h) in [(1920, 1080), (4000, 3000), (4000, 100), (100, 4000), (3000, 3000)] {
+            let (lh, lw, _, _) = plan_grid_max(w, h, 2000);
+            assert!(num_image_tokens(lh, lw) <= 2000, "{w}x{h}");
+        }
+        let (lh, lw, _, _) = plan_grid_max(1920, 1080, 2000);
+        assert!(num_image_tokens(lh, lw) > MAX_TOKENS);
     }
 
     #[test]

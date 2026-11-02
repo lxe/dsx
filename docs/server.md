@@ -13,6 +13,7 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 | `--overlay` | a GGUF of replacement tensors laid over the model's, such as an [uncensored overlay](overlays.md) (env `DSX_OVERLAY`) |
 | `--rank` | expert hotness order (`expert-rank.json` in the quant repo) |
 | `--vision` / `--no-vision` | image input (default: `vision.safetensors` beside the model); `--no-vision` for text only |
+| `--vision-max-tokens` | most tokens one image may cost (default 1024, DeepSeek's `vision_max_n_token`); larger images are scaled down to fit. Higher keeps more detail but goes past what the model was tuned on (env `DSX_VISION_MAX_TOKENS`) |
 
 **Server**
 

@@ -84,6 +84,10 @@ struct Cli {
     /// text only: don't load the vision weights even if `vision.safetensors` sits next to the model
     #[arg(long)]
     no_vision: bool,
+    /// most LLM tokens one image may cost; larger images are scaled down to fit. 1024 is DeepSeek's
+    /// `vision_max_n_token`; more keeps finer detail on big images but goes beyond what the model was tuned on
+    #[arg(long, env = "DSX_VISION_MAX_TOKENS", default_value_t = dsx_core::vision::MAX_TOKENS)]
+    vision_max_tokens: usize,
     /// conversation lineages kept for prefix reuse, including the active one. `1` (default) is the current
     /// single-lineage behaviour with no host parking; `>1` parks inactive lineages in the host cache so `A -> B -> A`
     /// resumes instead of prefilling from token 0.
@@ -116,8 +120,12 @@ async fn main() -> Result<()> {
         let dir = cli.model.as_ref().and_then(|m| if m.is_dir() { Some(m.clone()) } else { m.parent().map(|p| p.to_path_buf()) });
         cli.vision = dir.map(|d| d.join("vision.safetensors")).filter(|p| p.is_file());
     }
+    if cli.vision_max_tokens < 4 {
+        anyhow::bail!("--vision-max-tokens {}: an image needs at least 4", cli.vision_max_tokens);
+    }
+    dsx_core::vision::set_max_tokens(cli.vision_max_tokens);
     if let Some(v) = &cli.vision {
-        tracing::info!("vision: {}", v.display());
+        tracing::info!("vision: {} (at most {} tokens per image)", v.display(), cli.vision_max_tokens);
     }
     if cli.cache_sessions > 1 {
         tracing::info!(
