@@ -28,6 +28,9 @@ The routed experts, attention inputs, Engram, MTP and vision weights are byte-id
 experts apply unchanged. The overlay holds the 54 edited matrices in Q8_0, the same type as the T16 model's dense
 weights.
 
+Download: [lxe/DeepSeek-V4.1-Flash-1017-dsx-t16-uncensored-overlay](https://huggingface.co/lxe/DeepSeek-V4.1-Flash-1017-dsx-t16-uncensored-overlay)
+(1.54 GB). Based on dealignai's release; the refusal removal is their work.
+
 ## Making one
 
 `quant/overlay_gguf.py` reads only the named tensors from a Hugging Face checkpoint in DeepSeek's FP8 layout, by
