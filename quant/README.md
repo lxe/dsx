@@ -34,6 +34,8 @@ scripts are the build machine's):
 
 Calibration text (v3a on): 160 x 2048 tokens of coding-agent sessions, antirez's agent and code prompts, and 53
 sequences of the full model's reasoning traces on Omni-MATH and SuperGPQA questions (none from the evaluated rows).
+The T16 v1 release's calibration set (calib4) is published in
+[lxe/dsx-calibration](https://github.com/lxe/dsx-calibration), without its private agent-session rows.
 v4b's GPTQ pass takes ~3 h on one RTX 3090, plus GGUF assembly and the eval.
 
 ```bash
