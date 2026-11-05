@@ -779,8 +779,8 @@ extern "C" __global__ void engram_sums(const float* __restrict__ kv, const float
 
 // e4m3 OCP rounding of a value in units of its block scale (|v| <= 448), RNE: via the FNUZ converter at half scale
 DEV float e4m3_round(float v) {
-    const uint32_t c = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(v * 0.5f, 0.f, 0, false);
-    return 2.f * __builtin_amdgcn_cvt_f32_fp8(c, 0);
+    const uint32_t c = (uint32_t)fnuz_cvt_pk(v * 0.5f, 0.f, 0, false);
+    return 2.f * FNUZ_F32(c, 0);
 }
 // e2m1 rounding (RNE on the grid 0, .5, 1, 1.5, 2, 3, 4, 6), |v| <= 6
 DEV float e2m1_round(float v) {
@@ -836,11 +836,11 @@ template <int G> DEV float fp4_group_scale(float v, bool e4m3s) {
     return pow2_ceil(fmaxf(a, 6.f * ldexpf(1.f, -126)) / 6.f);
 }
 DEV uint32_t fp4_scale_byte(float s, bool e4m3s) {
-    if (e4m3s) return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(s * 0.5f, 0.f, 0, false) & 0xFFu;
+    if (e4m3s) return (uint32_t)fnuz_cvt_pk(s * 0.5f, 0.f, 0, false) & 0xFFu;
     return (__float_as_uint(s) >> 23) & 0xFFu;
 }
 DEV float fp4_scale_val(uint32_t b, bool e4m3s) {
-    if (e4m3s) return 2.f * __builtin_amdgcn_cvt_f32_fp8(b, 0);
+    if (e4m3s) return 2.f * FNUZ_F32(b, 0);
     return __uint_as_float(b << 23);
 }
 // Store lane i's fake-FP4 value x (scale s of its group of G lanes) into a packed row: lane pairs share a byte.
@@ -1382,7 +1382,7 @@ extern "C" __global__ void __launch_bounds__(512) attn_merge(const State* st, co
     // quantize to FP8 per 32 (wo_a's act_quant): 32-lane groups
     const float a = group_max<32>(fabsf(v));
     const float s = pow2_ceil(fmaxf(a, 1e-4f) / 448.f);
-    const uint32_t code = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(v * (0.5f / s), 0.f, 0, false) & 0xFF;
+    const uint32_t code = (uint32_t)fnuz_cvt_pk(v * (0.5f / s), 0.f, 0, false) & 0xFF;
     oq[h * HD + j] = (uint8_t)code;
     if ((j & 31) == 0) os[(h * HD + j) / 32] = 2.f * s;
 }
@@ -1435,9 +1435,9 @@ extern "C" __global__ void advance(State* st, const int* next) {
 
 // e2m1_val: with the packed FP4 row helpers above
 DEV float fnuz_round_pos(float x, uint32_t* code) {
-    const uint32_t c = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(x, 0.f, 0, false) & 0xFF;
+    const uint32_t c = (uint32_t)fnuz_cvt_pk(x, 0.f, 0, false) & 0xFF;
     *code = c;
-    return __builtin_amdgcn_cvt_f32_fp8(c, 0);
+    return FNUZ_F32(c, 0);
 }
 
 // One thread per (row, 32-group): choose the e4m3 scale (relative to `mul`) minimizing squared error over a search of

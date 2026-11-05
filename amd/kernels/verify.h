@@ -579,7 +579,7 @@ DEV void vgemv_xg_body(VJob J, int b, uint32_t cb3lo, uint32_t cb3hi, uint32_t c
             } else {
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    const f2v lo = __builtin_amdgcn_cvt_pk_f32_fp8(ss[j], false), hi = __builtin_amdgcn_cvt_pk_f32_fp8(ss[j], true);
+                    const f2v lo = FNUZ_PK_F32(ss[j], false), hi = FNUZ_PK_F32(ss[j], true);
                     wsc[0][j] = lo[0]; wsc[1][j] = lo[1]; wsc[2][j] = hi[0]; wsc[3][j] = hi[1];
                 }
             }
