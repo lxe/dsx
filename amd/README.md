@@ -119,7 +119,7 @@ DSXA_WEIGHTS="$PWD/dsx-mxfp4/DeepSeek-V4.1-Flash-1017-dsx-mxfp4-00001-of-00006.g
 | | |
 |---|---|
 | GPU | One AMD Instinct MI325X, 256 GiB HBM3E (`gfx942`), or MI350X, 288 GiB (`gfx950`, see below) |
-| ROCm | 7; measured on 7.14 (`gfx942`) and 10.1 (`gfx950`) |
+| ROCm | 7 for `gfx942`, measured on 7.14; 10.1 for `gfx950`, the only version tested there |
 | Host | Tested with 20 vCPUs and 157 GiB RAM |
 | Disk | NVMe, with room for the 270.5 GB export and the official Engram and MTP shards |
 | Build | Rust and `hipcc` (`/opt/rocm/bin/hipcc`, or set `HIPCC`) |
@@ -147,7 +147,7 @@ Measured on one MI350X VF under KVM (24 vCPUs, 251 GiB RAM, ROCm 10.1, in-box `a
 | Coding-profile server, 300-token greedy requests including prefill, six prompts, drafts off | 90 tokens/s |
 | Same, native drafts on, prompt lookup off | 181–182 tokens/s (108–263 by prompt), 47–48% acceptance |
 
-The Docker image still builds for `gfx942` only.
+The Docker image still builds for `gfx942` only, and `box/setup.sh` still installs the ROCm 7.14 `gfx942` packages.
 
 ## Tools
 
