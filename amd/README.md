@@ -118,14 +118,36 @@ DSXA_WEIGHTS="$PWD/dsx-mxfp4/DeepSeek-V4.1-Flash-1017-dsx-mxfp4-00001-of-00006.g
 
 | | |
 |---|---|
-| GPU | One AMD Instinct MI325X, 256 GiB HBM3E (`gfx942`) |
-| ROCm | 7; measured on 7.14 |
+| GPU | One AMD Instinct MI325X, 256 GiB HBM3E (`gfx942`), or MI350X, 288 GiB (`gfx950`, see below) |
+| ROCm | 7 for `gfx942`, measured on 7.14; 10.1 for `gfx950`, the only version tested there |
 | Host | Tested with 20 vCPUs and 157 GiB RAM |
 | Disk | NVMe, with room for the 270.5 GB export and the official Engram and MTP shards |
 | Build | Rust and `hipcc` (`/opt/rocm/bin/hipcc`, or set `HIPCC`) |
 
-The kernels compile for `gfx942`. Other AMD GPUs need their own kernel build and memory configuration.
+The kernels compile for `gfx942` by default; set `DSX_AMD_ARCH=gfx950` for the MI350X. Other AMD GPUs need their own kernel build and memory configuration.
 Without ROCm, the host code can be checked with `cargo check -p dsx-amd`, but the resulting build has no GPU kernels.
+
+### MI350X (`gfx950`)
+
+Build with `DSX_AMD_ARCH=gfx950 cargo build --release -p dsx-amd`; the model files and `serve-agentic-mi325x.sh` are unchanged.
+With 288 GiB the coding profile keeps the published placement (8,992 MXFP4, 6,368 3-bit) and leaves 28.8 GB of HBM free.
+
+gfx950 reads the same fp8 byte as OCP e4m3 rather than FNUZ, at twice the value. `kernels/common.h` converts at the hardware
+builtins, so the kernels and stored bytes stay as they are on gfx942.
+
+On Ubuntu 26.04 install `amdrocm-core-dev10.1-gfx950`, `amdrocm-blas-dev10.1` and `amdrocm-blas10.1-gfx950`, plus
+`linux-firmware-amd-graphics`: without that firmware `amdgpu` fails at boot on this GPU.
+
+Measured on one MI350X VF under KVM (24 vCPUs, 251 GiB RAM, ROCm 10.1, in-box `amdgpu`, Linux 7.0):
+
+| | |
+|---|---:|
+| Lucebox eval, two runs | KL 0.0505 / 0.0507, top-1 90.65% / 90.38%, perplexity 8.66 / 8.67 |
+| Single-stream decode, `bench` at 4K / 256K context | 114.6 / 110.5 tokens/s |
+| Coding-profile server, 300-token greedy requests including prefill, six prompts, drafts off | 90 tokens/s |
+| Same, native drafts on, prompt lookup off | 181–182 tokens/s (108–263 by prompt), 47–48% acceptance |
+
+The Docker image still builds for `gfx942` only, and `box/setup.sh` still installs the ROCm 7.14 `gfx942` packages.
 
 ## Tools
 
