@@ -1,4 +1,4 @@
-// common.h: shared device helpers for the dsx-amd kernels (gfx942 / CDNA3).
+// common.h: shared device helpers for the dsx-amd kernels (gfx942 / CDNA3, gfx950 / CDNA4).
 #pragma once
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -11,7 +11,24 @@ typedef short s4v __attribute__((ext_vector_type(4)));
 #define DEV __device__ __forceinline__
 
 // D = A(16x32 fp8) * B(32x16 fp8) + C. Lane l: A row l%16, k 8*(l/16)..+8; B col l%16, same k; D col l%16, rows 4*(l/16)+j.
+// fp8 bytes are stored in one format for both targets. gfx942's hardware reads them as FNUZ e4m3; gfx950's reads the same
+// byte as OCP e4m3, which is twice the FNUZ value (0x38: 0.5 vs 1.0). The kernels work in the FNUZ domain on both: on gfx950
+// the converters take and return FNUZ-domain values and an MFMA of two fp8 sides is scaled by 1/4. Byte 0x7F is NaN on
+// gfx950 (240 on gfx942), so FNUZ-domain values must stay within 224 (OCP 448); OCP-grid weights and scales already do.
+#if defined(__gfx950__)
+DEV f4 mfma_fp8(uint64_t a, uint64_t b, f4 c) {
+    const f4 z = {0, 0, 0, 0};
+    return c + __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8((long)a, (long)b, z, 0, 0, 0) * 0.25f;
+}
+#define fnuz_cvt_pk(a, b, tied, hi) __builtin_amdgcn_cvt_pk_fp8_f32((a) * 2.f, (b) * 2.f, (tied), (hi))
+#define FNUZ_F32(v, i) (0.5f * __builtin_amdgcn_cvt_f32_fp8((v), (i)))
+#define FNUZ_PK_F32(v, hi) (__builtin_amdgcn_cvt_pk_f32_fp8((v), (hi)) * 0.5f)
+#else
 DEV f4 mfma_fp8(uint64_t a, uint64_t b, f4 c) { return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8((long)a, (long)b, c, 0, 0, 0); }
+#define fnuz_cvt_pk(a, b, tied, hi) __builtin_amdgcn_cvt_pk_fp8_f32((a), (b), (tied), (hi))
+#define FNUZ_F32(v, i) __builtin_amdgcn_cvt_f32_fp8((v), (i))
+#define FNUZ_PK_F32(v, hi) __builtin_amdgcn_cvt_pk_f32_fp8((v), (hi))
+#endif
 // D = A(16x16 bf16) * B(16x16 bf16) + C. Lane l: A row l%16, k 4*(l/16)..+4.
 DEV f4 mfma_bf16(s4v a, s4v b, f4 c) { return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0); }
 
@@ -28,15 +45,15 @@ DEV float bf16_to_f32(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
 // fp8 e4m3 FNUZ (gfx942's fp8) from f32, RNE, saturating. The model's FP8 is OCP e4m3fn; an OCP value v is stored
 // as the FNUZ code of v/2 (same bits, exact), so a quantizer that targets OCP's grid at scale s writes FNUZ codes at 2s.
 DEV uint32_t cvt_fp8x4(float a, float b, float c, float d) {
-    int lo = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
-    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(c, d, lo, true);
+    int lo = fnuz_cvt_pk(a, b, 0, false);
+    return (uint32_t)fnuz_cvt_pk(c, d, lo, true);
 }
 DEV float fp8_to_f32(uint32_t v, int byte) {
     switch (byte) {
-        case 0: return __builtin_amdgcn_cvt_f32_fp8(v, 0);
-        case 1: return __builtin_amdgcn_cvt_f32_fp8(v, 1);
-        case 2: return __builtin_amdgcn_cvt_f32_fp8(v, 2);
-        default: return __builtin_amdgcn_cvt_f32_fp8(v, 3);
+        case 0: return FNUZ_F32(v, 0);
+        case 1: return FNUZ_F32(v, 1);
+        case 2: return FNUZ_F32(v, 2);
+        default: return FNUZ_F32(v, 3);
     }
 }
 
