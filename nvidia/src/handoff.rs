@@ -6,7 +6,7 @@
 //! and adds everything (`combine_experts`). Flags are sequence numbers: token k, layer l -> k * n_layers + l + 1.
 
 use crate::cpu::moe::{CpuMoe, ExpertW};
-use crate::cpu::pool::{P_CORES, Pool, pin_to};
+use crate::cpu::pool::{Pool, pin_to, topology};
 use crate::gpu::HostBuf;
 use crate::model::Model;
 use anyhow::Result;
@@ -195,14 +195,15 @@ impl CpuWorker {
         let handle = std::thread::Builder::new()
             .name("cpu-experts".into())
             .spawn(move || {
-                pin_to(crate::cpu::pool::WORKER_CPU);
-                // 14 threads on CPUs 0-13 (P-cores 0-6): 24 ms/token of CPU experts vs 30 with 8 threads (measured on the
+                let topo = topology();
+                pin_to(topo.worker);
+                // reference layout: 14 threads on CPUs 0-13 (P-cores 0-6; other machines: cpu::pool::topology()): 24 ms/token of CPU experts vs 30 with 8 threads (measured on the
                 // 1017 quant); CPUs 14-15 stay for the thread issuing GPU work and helpers. DSX_CPU_THREADS overrides.
                 // Spin 50 ms between jobs (decode layers come every ~1 ms), then sleep so prefill gets the cores.
                 // DSX_CPU_LIST=0,2,4 pins the pool to exactly those CPUs (experiments with core layouts)
                 let list: Option<Vec<usize>> = std::env::var("DSX_CPU_LIST").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-                let n = std::env::var("DSX_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(14usize).min(crate::cpu::pool::MAIN_CPU);
-                let cpus: Vec<usize> = list.unwrap_or_else(|| P_CORES[..n].to_vec());
+                let n = std::env::var("DSX_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(topo.default_threads()).min(topo.max_threads());
+                let cpus: Vec<usize> = list.unwrap_or_else(|| topo.pool[..n].to_vec());
                 let mut cm = CpuMoe::new(Pool::new(&cpus, Duration::from_millis(50)));
                 let nl = m.cfg.n_layers;
                 let d = m.cfg.dim;
