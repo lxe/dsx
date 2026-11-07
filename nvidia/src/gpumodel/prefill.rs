@@ -1359,7 +1359,7 @@ pub(crate) fn engram_gather(m: &Model, hist: &[i64], tn: usize, eidx: usize) -> 
     std::thread::scope(|sc| {
         for (chunk, idc) in ubuf.chunks_mut(per_thread * hd).zip(uniq.chunks(per_thread)) {
             sc.spawn(move || {
-                crate::cpu::pool::pin_to_set(&crate::cpu::pool::ALL_CPUS);
+                crate::cpu::pool::pin_to_set(&crate::cpu::pool::topology().all);
                 for (o, &row) in chunk.chunks_mut(hd).zip(idc) {
                     tab.row(row as usize, o);
                 }
