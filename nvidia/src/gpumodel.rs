@@ -527,9 +527,10 @@ impl<'m> GpuModel<'m> {
             candidates: vec![],
             engram_hist: vec![],
             cpu_moe: if matches!(m.src, crate::model::Source::Gguf(_)) {
-                crate::cpu::pool::pin_to(crate::cpu::pool::MAIN_CPU); // the caller spins too; keep it off the workers' cores
+                let topo = crate::cpu::pool::topology(); // first use: before this thread pins itself
+                crate::cpu::pool::pin_to(topo.main); // the caller spins too; keep it off the workers' cores
                 Some(crate::cpu::moe::CpuMoe::new(crate::cpu::pool::Pool::new(
-                    &crate::cpu::pool::P_CORES,
+                    &topo.sync_pool(),
                     std::time::Duration::from_millis(200),
                 )))
             } else {
@@ -1312,7 +1313,7 @@ impl<'m> GpuModel<'m> {
             std::thread::scope(|sc| {
                 for grp in groups {
                     sc.spawn(move || {
-                        crate::cpu::pool::pin_to_set(&crate::cpu::pool::AUX_CPUS);
+                        crate::cpu::pool::pin_to_set(&crate::cpu::pool::topology().aux);
                         for (row, o) in grp {
                             tab.row(row, o);
                         }
@@ -1810,7 +1811,7 @@ impl<'m> GpuModel<'m> {
             let hist = self.engram_hist.clone();
             let (ptr, len) = (self.eng_host.host_ptr() as usize, self.eng_host.bytes / 4);
             Some(std::thread::spawn(move || {
-                crate::cpu::pool::pin_to_set(&crate::cpu::pool::AUX_CPUS);
+                crate::cpu::pool::pin_to_set(&crate::cpu::pool::topology().aux);
                 let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, len) };
                 Self::prefetch_into(ms, &hist, out)
             }))

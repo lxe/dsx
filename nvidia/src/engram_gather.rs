@@ -91,7 +91,7 @@ impl EngramGather {
         let m: &'static Model = unsafe { std::mem::transmute::<&Model, &'static Model>(m) };
         let tabs = m.engram.as_ref().ok_or_else(|| anyhow::anyhow!("no engram tables"))?;
         let tabs = (0..m.cfg.engram_layers.len()).map(|l| tabs.layer(l, m.cfg.engram_dim)).collect::<Result<Vec<_>>>()?;
-        Self::with_source(Box::new(ModelRows { m, tabs }), out, prof, &crate::cpu::pool::AUX_CPUS)
+        Self::with_source(Box::new(ModelRows { m, tabs }), out, prof, &crate::cpu::pool::topology().aux)
     }
 
     /// one worker per CPU in `cpus`, each pinned to it
