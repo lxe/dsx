@@ -151,6 +151,16 @@ impl Topology {
         if self.reference { MAIN_CPU } else { self.pool.len() }
     }
 
+    /// On a derived layout no CPU is otherwise idle, so the helpers share the two spinning CPUs. A smaller
+    /// `DSX_CPU_THREADS` leaves pool CPUs unused: give those to the helpers instead (the reference layout keeps its
+    /// own helper CPUs). On a 12-vCPU VM, 9 pool threads + helpers on CPU 9 decoded 13% faster than 10 threads with
+    /// the helpers on the spinners' CPUs (Engram stage 4.5 -> 2.4 ms/token).
+    pub fn give_helpers_unused_pool_cpus(&mut self, threads: usize) {
+        if !self.reference && threads > 0 && threads < self.pool.len() {
+            self.aux = self.pool[threads..].to_vec();
+        }
+    }
+
     /// CPUs of the synchronous (non-handoff) expert pool: all 16 P-core threads on the reference layout
     pub fn sync_pool(&self) -> Vec<usize> {
         if self.reference { P_CORES.to_vec() } else { self.pool.clone() }
@@ -171,7 +181,10 @@ pub fn allowed_cpus() -> Vec<usize> {
 pub fn topology() -> &'static Topology {
     static T: std::sync::OnceLock<Topology> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let t = Topology::for_cpus(&allowed_cpus());
+        let mut t = Topology::for_cpus(&allowed_cpus());
+        if let Some(n) = std::env::var("DSX_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            t.give_helpers_unused_pool_cpus(n);
+        }
         if !t.reference {
             eprintln!(
                 "cpu layout: {} allowed CPUs (not the reference 0-19): expert pool {:?}, GPU issue {}, coordinator {}, helpers {:?}",
@@ -325,6 +338,20 @@ mod tests {
         // tiny: everything shares
         let t = Topology::for_cpus(&[0, 1]);
         assert_eq!((t.main, t.worker, t.pool.len()), (1, 1, 2));
+    }
+
+    #[test]
+    fn helpers_take_unused_pool_cpus() {
+        let mut t = Topology::for_cpus(&(0..12).collect::<Vec<_>>());
+        t.give_helpers_unused_pool_cpus(9);
+        assert_eq!(t.aux, vec![9]);
+        assert_eq!(&t.pool[..9], &(0..9).collect::<Vec<_>>()[..]);
+        let mut t = Topology::for_cpus(&(0..12).collect::<Vec<_>>());
+        t.give_helpers_unused_pool_cpus(10); // the whole pool in use: unchanged
+        assert_eq!(t.aux, vec![10, 11]);
+        let mut t = Topology::for_cpus(&(0..20).collect::<Vec<_>>());
+        t.give_helpers_unused_pool_cpus(8); // reference layout: unchanged
+        assert_eq!(t.aux, AUX_CPUS.to_vec());
     }
 
     #[test]
