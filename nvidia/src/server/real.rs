@@ -167,7 +167,7 @@ impl Real {
         Ok(())
     }
 
-    fn generate_single(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+    fn generate_single(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
         let t0 = Instant::now();
         anyhow::ensure!(!prompt.is_empty(), "empty prompt");
         let key = prompt_key(prompt, &p.images);
@@ -250,6 +250,7 @@ impl Real {
         // Snapshot rather than clear: preserve cumulative event profiling for other consumers.
         let events0 = if profile { self.gm.evprof.clone() } else { None };
         let mut profile_steps = 0usize;
+        cached(decision.start);
         let td = Instant::now();
         let mut sampler = Sampler::from_params(p);
         let mut fin = Finish::Length;
@@ -309,10 +310,10 @@ impl Real {
         Ok(fin)
     }
 
-    fn generate_multi(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+    fn generate_multi(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
         // Take the manager out so the GPU model and the cache can be borrowed independently.
         let mut cache = self.multi.take().expect("multi cache");
-        let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, prompt, p, emit);
+        let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, prompt, p, cached, emit);
         if r.is_err() {
             // the device state and the active lineage's `cached` tokens may disagree after a failed prefill or rewind:
             // forget that lineage so the next request restores a parked session or prefills cold
@@ -329,10 +330,14 @@ impl Real {
 
 impl Engine for Real {
     fn generate(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+        self.generate_reporting(prompt, p, &mut |_| {}, emit)
+    }
+
+    fn generate_reporting(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
         if self.multi.is_some() {
-            self.generate_multi(prompt, p, emit)
+            self.generate_multi(prompt, p, cached, emit)
         } else {
-            self.generate_single(prompt, p, emit)
+            self.generate_single(prompt, p, cached, emit)
         }
     }
 
@@ -510,6 +515,7 @@ fn multi_request(
     cache: &mut SessionCache,
     prompt: &[u32],
     p: &GenParams,
+    cached: &mut dyn FnMut(usize),
     emit: &mut dyn FnMut(u32) -> bool,
 ) -> Result<(Finish, GenStats)> {
     let t0 = Instant::now();
@@ -842,6 +848,7 @@ fn multi_request(
     }
 
     // ---- decode: raw logits stay separate from the penalized sampling copy ----
+    cached(usable_start);
     let td = Instant::now();
     let mut sampler = Sampler::from_params(p);
     let mut fin = Finish::Length;
@@ -984,6 +991,7 @@ fn multi_request(
         cache_context = cache.fingerprint.describe(),
         "session cache request"
     );
-    let stats = GenStats { prefill: Some(t0.elapsed()), decode: Some(td.elapsed()), cached_prompt_tokens: usable_start };
+    // prefill = up to the decode loop (t0.elapsed() here would also count the whole decode)
+    let stats = GenStats { prefill: Some(td.duration_since(t0)), decode: Some(td.elapsed()), cached_prompt_tokens: usable_start };
     Ok((fin, stats))
 }
