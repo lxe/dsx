@@ -328,9 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn allowed_cpus_matches_parallelism() {
-        let n = std::thread::available_parallelism().unwrap().get();
-        assert_eq!(allowed_cpus().len(), n);
+    fn allowed_cpus_is_the_affinity_mask() {
+        // available_parallelism() also applies cgroup CPU quotas, so it can be smaller than the mask: only a bound
+        let cpus = allowed_cpus();
+        assert!(!cpus.is_empty());
+        assert!(cpus.windows(2).all(|w| w[0] < w[1]), "sorted, no duplicates");
+        assert!(cpus.len() >= std::thread::available_parallelism().unwrap().get());
     }
 
     #[test]
