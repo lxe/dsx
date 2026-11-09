@@ -430,24 +430,75 @@ fn inference_stream(
     failed: Arc<Mutex<Option<String>>>,
     timing: Arc<Mutex<Timing>>,
 ) -> Pin<Box<dyn Stream<Item = InferenceChunk> + Send>> {
-    let ready = InferenceChunk::Ready {
+    // `Ready` carries the prompt usage, so it waits for the engine's `Prefilled` (the cache-hit count); an engine
+    // that does not report one gets `Ready` with 0 just before its first other event, as before.
+    let ready = move |cached: usize| InferenceChunk::Ready {
         system_fingerprint: Some("dsx".into()),
-        prompt_usage: PromptUsage { prompt_tokens: n_prompt, prompt_cache_hit_tokens: 0 },
+        prompt_usage: PromptUsage { prompt_tokens: n_prompt, prompt_cache_hit_tokens: cached.min(n_prompt) },
     };
-    let rest = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map_while(move |ev| match ev {
-        Event::Token(t) => {
-            timing.lock().unwrap().token();
-            Some(InferenceChunk::Token { token_id: t })
+    Box::pin(ReadyFirst { rx, ready_sent: false, pending: None, ended: false, ready, failed, timing })
+}
+
+/// Engine events -> inference chunks, `Ready` first (see `inference_stream`).
+struct ReadyFirst<F> {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ready_sent: bool,
+    /// the chunk that follows a `Ready` sent ahead of it
+    pending: Option<InferenceChunk>,
+    ended: bool,
+    ready: F,
+    failed: Arc<Mutex<Option<String>>>,
+    timing: Arc<Mutex<Timing>>,
+}
+
+impl<F: Fn(usize) -> InferenceChunk + Unpin> Stream for ReadyFirst<F> {
+    type Item = InferenceChunk;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<InferenceChunk>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if let Some(c) = this.pending.take() {
+            return Poll::Ready(Some(c));
         }
-        Event::Done { finish: Finish::Stop } => Some(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }),
-        Event::Done { finish: Finish::Length } => Some(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }),
-        Event::Done { finish: Finish::Cancelled } => None,
-        Event::Error(e) => {
-            *failed.lock().unwrap() = Some(e);
-            None
+        loop {
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            let ev = match this.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(ev) => ev,
+            };
+            let next = match ev {
+                Some(Event::Prefilled { cached_prompt_tokens }) => {
+                    if this.ready_sent {
+                        continue;
+                    }
+                    this.ready_sent = true;
+                    return Poll::Ready(Some((this.ready)(cached_prompt_tokens)));
+                }
+                Some(Event::Token(t)) => {
+                    this.timing.lock().unwrap().token();
+                    Some(InferenceChunk::Token { token_id: t })
+                }
+                Some(Event::Done { finish: Finish::Stop }) => Some(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }),
+                Some(Event::Done { finish: Finish::Length }) => Some(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }),
+                Some(Event::Done { finish: Finish::Cancelled }) | None => None,
+                Some(Event::Error(e)) => {
+                    *this.failed.lock().unwrap() = Some(e);
+                    None
+                }
+            };
+            if next.is_none() {
+                this.ended = true;
+            }
+            if !this.ready_sent {
+                this.ready_sent = true;
+                this.pending = next;
+                return Poll::Ready(Some((this.ready)(0)));
+            }
+            return Poll::Ready(next);
         }
-    });
-    Box::pin(tokio_stream::iter([ready]).chain(rest))
+    }
 }
 
 /// Request timing as seen by the HTTP layer: prompt = submit -> first token, predicted = first -> last token.

@@ -51,6 +51,13 @@ pub struct GenStats {
 pub trait Engine: Send {
     /// Generate after `prompt`. Call `emit(token)` per generated token; stop early when it returns false.
     fn generate(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish>;
+    /// `generate`, also reporting the prompt tokens a KV/prefix cache served: `cached(n)` at most once, before the
+    /// first `emit`. The API's usage (`prompt_cache_hit_tokens`, `cached_tokens`, ...) waits for it. The default
+    /// reports nothing (usage then says 0).
+    fn generate_reporting(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+        let _ = cached;
+        self.generate(prompt, p, emit)
+    }
     /// Timings/cache stats of the last `generate` call.
     fn last_stats(&self) -> GenStats {
         GenStats::default()
@@ -79,6 +86,8 @@ pub trait BatchEngine: Send {
 /// Engine thread -> request handler.
 #[derive(Debug)]
 pub enum Event {
+    /// The prompt is processed; `cached_prompt_tokens` of it came from a cache. Sent at most once, before any token.
+    Prefilled { cached_prompt_tokens: usize },
     Token(u32),
     Done { finish: Finish },
     Error(String),
@@ -184,6 +193,10 @@ fn run_job(engine: &mut dyn Engine, job: Job) {
     let mut first: Option<Instant> = None;
     let mut generated = 0usize;
     let (mut hit_stop, mut hit_len, mut gone) = (false, false, false);
+    let ptx = tx.clone();
+    let mut cached = |n: usize| {
+        let _ = ptx.send(Event::Prefilled { cached_prompt_tokens: n });
+    };
     let r = {
         let mut emit = |tok: u32| -> bool {
             if hit_stop || hit_len || gone {
@@ -205,7 +218,7 @@ fn run_job(engine: &mut dyn Engine, job: Job) {
             }
             true
         };
-        if params.max_new == 0 { Ok(Finish::Length) } else { engine.generate(&prompt, &params, &mut emit) }
+        if params.max_new == 0 { Ok(Finish::Length) } else { engine.generate_reporting(&prompt, &params, &mut cached, &mut emit) }
     };
     let total = t0.elapsed();
     let st = engine.last_stats();
@@ -329,6 +342,9 @@ fn run_batch(mut engine: Box<dyn BatchEngine>, rx: std_mpsc::Receiver<Job>, pend
             Ok(out) => {
                 for (id, tok) in out {
                     let Some(r) = running.get_mut(&id) else { continue };
+                    if r.first.is_none() {
+                        let _ = r.tx.send(Event::Prefilled { cached_prompt_tokens: engine.cached_prompt_tokens(id) });
+                    }
                     r.first.get_or_insert_with(Instant::now);
                     if r.params.stop_token_ids.contains(&tok) {
                         done(engine.as_mut(), &mut running, id, Some(Finish::Stop), None);
