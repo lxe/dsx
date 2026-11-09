@@ -438,3 +438,47 @@ async fn large_request_bodies_are_accepted() {
     let (status, text) = post(&base, "/v1/chat/completions", body).await;
     assert_ne!(status, 413, "{}", &text[..text.len().min(200)]);
 }
+
+/// An engine that reports `n` prompt tokens served from a cache, then replies like the scripted mock.
+struct CachedMock {
+    inner: MockEngine,
+    n: usize,
+}
+
+impl Engine for CachedMock {
+    fn generate(&mut self, prompt: &[u32], p: &dsx_core::server::GenParams, emit: &mut dyn FnMut(u32) -> bool) -> anyhow::Result<dsx_core::server::Finish> {
+        self.inner.generate(prompt, p, emit)
+    }
+    fn generate_reporting(&mut self, prompt: &[u32], p: &dsx_core::server::GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> anyhow::Result<dsx_core::server::Finish> {
+        cached(self.n);
+        self.inner.generate(prompt, p, emit)
+    }
+}
+
+async fn start_cached(n: usize) -> String {
+    let tok = tokenizer();
+    let t2 = tok.clone();
+    let engine = EngineHandle::spawn(move || Ok(Box::new(CachedMock { inner: MockEngine::new(t2, MockMode::Scripted), n }) as Box<dyn Engine>)).unwrap();
+    let st = AppState::new(engine, tok, ServerConfig::default()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(dsx_core::server::serve(listener, st));
+    base
+}
+
+#[tokio::test]
+async fn usage_reports_cached_prompt_tokens() {
+    let base = start_cached(7).await;
+    let msgs = json!([{"role": "user", "content": "Hello there, how are you today?"}]);
+    let r = post_json(&base, "/v1/chat/completions", json!({"model": "m", "messages": msgs})).await;
+    assert_eq!(r["usage"]["prompt_tokens_details"]["cached_tokens"], 7);
+    assert_eq!(r["usage"]["prompt_cache_hit_tokens"], 7);
+    assert_eq!(r["usage"]["prompt_cache_miss_tokens"].as_u64().unwrap() + 7, r["usage"]["prompt_tokens"].as_u64().unwrap());
+    let (_, text) = post(&base, "/v1/chat/completions", json!({"model": "m", "stream": true,
+        "stream_options": {"include_usage": true}, "messages": msgs})).await;
+    let u = sse(&text).into_iter().filter_map(|(_, d)| d.get("usage").filter(|u| u.is_object()).cloned()).last().unwrap();
+    assert_eq!(u["prompt_cache_hit_tokens"], 7);
+    assert_eq!(u["prompt_tokens_details"]["cached_tokens"], 7);
+    let m = post_json(&base, "/v1/messages", json!({"model": "m", "max_tokens": 64, "messages": msgs})).await;
+    assert_eq!(m["usage"]["cache_read_input_tokens"], 7);
+}
