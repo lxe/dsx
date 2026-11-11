@@ -55,7 +55,15 @@ pub trait Engine: Send {
     fn last_stats(&self) -> GenStats {
         GenStats::default()
     }
+    /// Called on the engine thread while no job is queued: one short slice of background work (a few ms at most, so a
+    /// new job waits no longer). Returns true when more work is waiting (the next slice follows at once).
+    fn idle(&mut self) -> bool {
+        false
+    }
 }
+
+/// How long the engine thread waits for a job before giving `Engine::idle` a slice.
+const IDLE_TICK: Duration = Duration::from_millis(200);
 
 /// An engine that runs many sequences at once (continuous batching). The worker thread admits queued requests while
 /// `has_room`, then calls `step` in a loop; each step advances every running sequence (prefill chunks and/or one
@@ -119,9 +127,17 @@ impl EngineHandle {
                         return;
                     }
                 };
-                while let Ok(job) = rx.recv() {
-                    run_job(engine.as_mut(), job);
-                    pend.fetch_sub(1, Ordering::SeqCst);
+                let mut more = false;
+                loop {
+                    match rx.recv_timeout(if more { Duration::from_millis(1) } else { IDLE_TICK }) {
+                        Ok(job) => {
+                            run_job(engine.as_mut(), job);
+                            pend.fetch_sub(1, Ordering::SeqCst);
+                            more = false;
+                        }
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => more = engine.idle(),
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             })?;
         ready_rx.recv().context("engine thread died during construction")??;
