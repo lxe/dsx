@@ -101,6 +101,10 @@ struct Cli {
     /// long system/tools prefix can replay only the divergent tail from an earlier anchor.
     #[arg(long, default_value_t = 16384)]
     prefix_anchor_tokens: usize,
+    /// forget what automatic tiering learned for this model (usage, GPU and disk measurements, SSD buffer) and start
+    /// from the shipped ranking; tiering itself needs no option (docs/tiering.md)
+    #[arg(long)]
+    tier_reset: bool,
 }
 
 #[tokio::main]
@@ -109,6 +113,9 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let mut cli = Cli::parse();
+    if cli.tier_reset {
+        dsx::tier::request_reset();
+    }
     if let Some(r) = cli.defer_rank {
         // read once by the engine (handoff::defer) before the model starts
         unsafe { std::env::set_var("DSX_DEFER", r.to_string()) };

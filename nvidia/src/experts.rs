@@ -762,8 +762,8 @@ mod place_tests {
 /// at RAM speed and prefill DMAs them to GPU0 at full PCIe speed (24.7 GB/s on .102 vs 13 from 4 KB pages).
 pub struct Arena {
     pub buf: crate::gpu::HostBuf,
-    /// (layer, expert) -> (gate, up, down) byte ranges in buf
-    pub slots: HashMap<(usize, usize), [(usize, usize); 3]>,
+    /// (layer, expert) -> (gate, up, down) byte ranges in buf; `replace` changes it while the server is idle
+    slots: std::sync::RwLock<HashMap<(usize, usize), [(usize, usize); 3]>>,
     pub bytes: usize,
 }
 
@@ -909,12 +909,47 @@ impl Arena {
             }).count();
             eprintln!("arena verify: {bad} of {} experts differ from the file", take.len());
         }
-        Ok((Arena { buf, slots, bytes: tot }, rest))
+        Ok((Arena { buf, slots: std::sync::RwLock::new(slots), bytes: tot }, rest))
     }
 
     pub fn get(&self, l: usize, e: usize) -> Option<[&[u8]; 3]> {
-        let s = self.slots.get(&(l, e))?;
+        let s = *self.slots.read().unwrap().get(&(l, e))?;
         let b = self.buf.as_slice::<u8>();
         Some([&b[s[0].0..s[0].0 + s[0].1], &b[s[1].0..s[1].0 + s[1].1], &b[s[2].0..s[2].0 + s[2].1]])
+    }
+
+    /// Hand expert (l, e)'s bytes to `f` while `replace` is kept out (a reader on another thread than the engine's, e.g.
+    /// automatic tiering copying an expert ahead of a move, sees either the old or the new expert, never a mix).
+    /// False when the arena does not hold it.
+    pub fn read_locked(&self, l: usize, e: usize, f: &mut dyn FnMut([&[u8]; 3])) -> bool {
+        let slots = self.slots.read().unwrap();
+        let Some(s) = slots.get(&(l, e)) else { return false };
+        let b = self.buf.as_slice::<u8>();
+        f([&b[s[0].0..s[0].0 + s[0].1], &b[s[1].0..s[1].0 + s[1].1], &b[s[2].0..s[2].0 + s[2].1]]);
+        true
+    }
+
+    /// experts held
+    pub fn len(&self) -> usize {
+        self.slots.read().unwrap().len()
+    }
+
+    /// Put `new`'s bytes (gate, up, down) into the place of `victim`, whose three ranges must have the same lengths;
+    /// false (and nothing changed) otherwise. `get` hands out slices without a lock, so the caller must be the only
+    /// user of the arena while this runs: the engine thread, with no pass running, no copy from the arena in flight
+    /// and the CPU worker idle (automatic tiering does it in pauses, tier.rs).
+    pub fn replace(&self, victim: (usize, usize), new: (usize, usize), parts: [&[u8]; 3]) -> bool {
+        let mut slots = self.slots.write().unwrap();
+        let Some(&r) = slots.get(&victim) else { return false };
+        if slots.contains_key(&new) || (0..3).any(|k| r[k].1 != parts[k].len()) {
+            return false;
+        }
+        for k in 0..3 {
+            // the buffer is ours to write: no reader per the contract above
+            unsafe { std::ptr::copy_nonoverlapping(parts[k].as_ptr(), self.buf.host_ptr().add(r[k].0), r[k].1) };
+        }
+        slots.remove(&victim);
+        slots.insert(new, r);
+        true
     }
 }

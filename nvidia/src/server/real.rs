@@ -329,11 +329,14 @@ impl Real {
 
 impl Engine for Real {
     fn generate(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
-        if self.multi.is_some() {
-            self.generate_multi(prompt, p, emit)
-        } else {
-            self.generate_single(prompt, p, emit)
-        }
+        // tiering: a request (its prefill too) is busy time; background copies and warming wait until it is over
+        let _busy = crate::tier::global().map(|t| t.busy());
+        if self.multi.is_some() { self.generate_multi(prompt, p, emit) } else { self.generate_single(prompt, p, emit) }
+    }
+
+    fn idle(&mut self) -> bool {
+        // a failed slice only stops this round of moves; the next request runs as usual
+        self.gm.tier_idle().unwrap_or(false)
     }
 
     fn last_stats(&self) -> GenStats {

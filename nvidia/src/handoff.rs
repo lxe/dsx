@@ -214,6 +214,8 @@ impl CpuWorker {
                 let noop = std::env::var_os("DSX_CPU_NOOP").is_some();
                 // DSX_LOG_ROUTES=path: one line per (pass, layer) with every token's picks, for placement studies
                 let mut route_log = std::env::var("DSX_LOG_ROUTES").ok().and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new);
+                // automatic tiering: usage counts, served-from tier, SSD-buffer copies (tier.rs)
+                let tier = crate::tier::for_worker(nl, ne);
                 loop {
                     seq += 1;
                     let l = (seq as usize - 1) % nl;
@@ -228,7 +230,7 @@ impl CpuWorker {
                                 ids.iter()
                                     .map(|&e| {
                                         let x = &m.layers[l].experts[e];
-                                        match arena.and_then(|a| a.get(l, e)) {
+                                        match arena.and_then(|a| a.get(l, e)).or_else(|| tier.and_then(|t| t.ssd_get(l, e))) {
                                             Some([g, u, dn]) => ExpertW { gu: x.gate.ty, gate: g, up: u, dn: x.down.ty, down: dn },
                                             None => ExpertW { gu: x.gate.ty, gate: x.gate.bytes(), up: x.up.bytes(), dn: x.down.ty, down: x.down.bytes() },
                                         }
@@ -285,6 +287,12 @@ impl CpuWorker {
                     y.resize(nt * d, 0.0);
                     x.copy_from_slice(xch.x(nt));
                     let (sel, wts) = (xch.sel(nt * top_k).to_vec(), xch.wts(nt * top_k).to_vec());
+                    if let Some(t) = tier {
+                        t.note_picks(l, &sel);
+                        if l + 1 == nl {
+                            t.note_decode();
+                        }
+                    }
                     // inputs copied: under DSX_DEFER the main GPU may now publish the next layer over them
                     xch.flag(XACK).store(seq, Ordering::Release);
                     let defer_rank = if nt == 1 { defer() } else { None };
@@ -306,6 +314,9 @@ impl CpuWorker {
                             a.store((f32::from_bits(a.load(Ordering::Relaxed)) + 1.0).to_bits(), Ordering::Relaxed);
                             pk[0].fetch_add(1, Ordering::Relaxed);
                             if !oc[l * ne + e].load(Ordering::Relaxed) {
+                                if let Some(tr) = tier {
+                                    tr.note_gpu(l, e);
+                                }
                                 continue;
                             }
                             pk[1].fetch_add(1, Ordering::Relaxed);
@@ -334,8 +345,24 @@ impl CpuWorker {
                             .map(|&e| {
                                 let x = &m.layers[l].experts[e];
                                 match arena.and_then(|a| a.get(l, e)) {
-                                    Some([g, u, dn]) => ExpertW { gu: x.gate.ty, gate: g, up: u, dn: x.down.ty, down: dn },
-                                    None => ExpertW { gu: x.gate.ty, gate: x.gate.bytes(), up: x.up.bytes(), dn: x.down.ty, down: x.down.bytes() },
+                                    Some([g, u, dn]) => {
+                                        if let Some(t) = tier {
+                                            t.note_hit(crate::tier::Hit::Arena, nt as u64);
+                                        }
+                                        ExpertW { gu: x.gate.ty, gate: g, up: u, dn: x.down.ty, down: dn }
+                                    }
+                                    None => match tier.and_then(|t| t.ssd_get(l, e)) {
+                                        Some([g, u, dn]) => {
+                                            tier.unwrap().note_hit(crate::tier::Hit::Ssd, nt as u64);
+                                            ExpertW { gu: x.gate.ty, gate: g, up: u, dn: x.down.ty, down: dn }
+                                        }
+                                        None => {
+                                            if let Some(t) = tier {
+                                                t.note_hit(crate::tier::Hit::File, nt as u64);
+                                            }
+                                            ExpertW { gu: x.gate.ty, gate: x.gate.bytes(), up: x.up.bytes(), dn: x.down.ty, down: x.down.bytes() }
+                                        }
+                                    },
                                 }
                             })
                             .collect()
