@@ -40,6 +40,65 @@ enum Cmd {
         #[arg(short, default_value_t = 32)]
         n: usize,
     },
+    /// Download DSpark's draft weights (only the checkpoint shards holding `mtp.*`, ~8 GB of ~150) plus config.json and
+    /// the index into DIR, resumably, each shard checked against the hub's SHA-256. Uses `curl` and `sha256sum`.
+    FetchMtp {
+        dir: PathBuf,
+        #[arg(long, default_value = "deepseek-ai/DeepSeek-V4.1-Flash-1017")]
+        repo: String,
+        /// base URL of the hub (a mirror may be given)
+        #[arg(long, default_value = "https://huggingface.co")]
+        hub: String,
+    },
+    /// Weight-streaming speed of each GPU: the decode GEMV kernels (Q8 repacked, one and five tokens, attention- and
+    /// head-sized) and a device copy, in GB/s of weights read; with and without fused multiply-add. Needs no model;
+    /// allocates ~1.5 GB per GPU. Prints one `gemv-json` line.
+    #[cfg(feature = "cuda")]
+    BenchGemv {
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+    },
+    /// DSpark acceptance on the GPU engine (a GGUF plus the checkpoint's mtp.* shards): greedy decode on the GPUs, a
+    /// draft from the CPU reference after every token, scored against the tokens the model actually produces next.
+    /// Prints one `dspark-json` line (per draft: accepted count and confidences) for offline cost models.
+    #[cfg(feature = "cuda")]
+    SpecDraft {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        engram: Option<PathBuf>,
+        /// directory with config.json, model.safetensors.index.json and the shards holding mtp.*
+        #[arg(long)]
+        mtp: PathBuf,
+        /// prompt token ids, comma separated, or @file; several prompts separated by ';'
+        #[arg(long)]
+        ids: String,
+        #[arg(short, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        #[arg(long = "main-gb", value_name = "GB", default_value_t = -1.5, allow_negative_numbers = true)]
+        gpu0_gb: f64,
+        #[arg(long = "aux-gb", value_name = "GB", default_value_t = -1.0, allow_negative_numbers = true)]
+        gpu1_gb: f64,
+        #[arg(long, default_value_t = 0.0)]
+        arena_gb: f64,
+        #[arg(long)]
+        rank: Option<PathBuf>,
+        /// draft on the main GPU (DSpark stack uploaded next to the model) instead of the CPU reference
+        #[arg(long)]
+        gpu: bool,
+        /// with --gpu: also draft with the CPU reference for the first N tokens and compare
+        #[arg(long, default_value_t = 0)]
+        check_cpu: usize,
+        /// with --gpu: afterwards decode the same n tokens speculatively (draft, verify pass, keep the accepted
+        /// prefix) in several variants, against the plain run's tokens and time
+        #[arg(long)]
+        spec: bool,
+        /// prefill buffer rows (verify passes need them)
+        #[arg(long, default_value_t = 128)]
+        chunk: usize,
+    },
     /// Prefill a prompt in chunks, then decode greedily; --check also runs the prompt token by token and compares.
     #[cfg(feature = "cuda")]
     Gen {
@@ -224,6 +283,81 @@ fn load(p: &std::path::Path, engram: Option<&std::path::Path>) -> Result<Model> 
     if p.is_dir() { Model::load_hf(p) } else { Model::load(p, engram, overlay.as_deref()) }
 }
 
+/// `dsx fetch-mtp`: the draft shards of the official checkpoint, nothing else
+/// A shard name from the index that is safe to join to the target directory: one plain component, no `..`, not absolute.
+fn safe_shard_name(s: &str) -> bool {
+    let p = std::path::Path::new(s);
+    !s.is_empty() && !s.contains('\\') && p.components().count() == 1 && matches!(p.components().next(), Some(std::path::Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    #[test]
+    fn shard_names_are_plain_file_names() {
+        assert!(super::safe_shard_name("model-00046-of-00046.safetensors"));
+        for bad in ["", "..", "../x.safetensors", "/etc/passwd", "a/b.safetensors", ".", "a\\..\\b"] {
+            assert!(!super::safe_shard_name(bad), "{bad}");
+        }
+    }
+}
+
+fn fetch_mtp(dir: &std::path::Path, repo: &str, hub: &str) -> Result<()> {
+    use std::process::Command;
+    std::fs::create_dir_all(dir)?;
+    let base = format!("{}/{repo}/resolve/main", hub.trim_end_matches('/'));
+    let curl = |name: &str, extra: &[&str]| -> Result<()> {
+        let st = Command::new("curl").args(["-fL", "--retry", "5", "--retry-delay", "5", "-C", "-", "-o"]).arg(dir.join(name)).args(extra).arg(format!("{base}/{name}")).status()?;
+        anyhow::ensure!(st.success(), "curl {name}: {st}");
+        Ok(())
+    };
+    // HEAD: size and, for LFS files, the SHA-256 (x-linked-etag)
+    let head = |name: &str| -> Result<(Option<u64>, Option<String>)> {
+        let out = Command::new("curl").args(["-fsIL"]).arg(format!("{base}/{name}")).output()?;
+        anyhow::ensure!(out.status.success(), "HEAD {name}: {}", String::from_utf8_lossy(&out.stderr));
+        let txt = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let field = |k: &str| txt.lines().rev().find_map(|l| l.strip_prefix(k).map(|v| v.trim().trim_matches('"').to_string()));
+        let size = field("x-linked-size:").or_else(|| field("content-length:")).and_then(|v| v.parse().ok());
+        Ok((size, field("x-linked-etag:")))
+    };
+    for f in ["config.json", "model.safetensors.index.json"] {
+        let _ = std::fs::remove_file(dir.join(f));
+        curl(f, &[])?;
+    }
+    let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
+    let mut shards: Vec<String> = idx["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("index without weight_map"))?.iter().filter(|(k, _)| k.starts_with("mtp.")).filter_map(|(_, v)| v.as_str().map(String::from)).collect();
+    shards.sort();
+    shards.dedup();
+    anyhow::ensure!(!shards.is_empty(), "{repo}: no mtp.* tensors in the index");
+    // the names come from a downloaded file and become paths under `dir`: plain file names only
+    for s in &shards {
+        anyhow::ensure!(safe_shard_name(s), "{repo}: index names shard {s:?}, not a plain file name: refused");
+    }
+    for s in &shards {
+        let (size, sha) = head(s)?;
+        let have = std::fs::metadata(dir.join(s)).map(|m| m.len()).ok();
+        if have.is_some() && have == size {
+            eprintln!("{s}: present ({} GB)", size.unwrap_or(0) as f64 / 1e9);
+        } else {
+            eprintln!("{s}: downloading {} GB", size.unwrap_or(0) as f64 / 1e9);
+            curl(s, &[])?;
+        }
+        match sha.filter(|h| h.len() == 64) {
+            Some(want) => {
+                let out = Command::new("sha256sum").arg(dir.join(s)).output()?;
+                let got = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
+                if got != want {
+                    let _ = std::fs::remove_file(dir.join(s));
+                    anyhow::bail!("{s}: SHA-256 {got} != {want} (removed; run again)");
+                }
+            }
+            None => eprintln!("warning: {s}: the hub sent no SHA-256 (x-linked-etag), so the file is checked by size only"),
+        }
+    }
+    let st = dsx::safetensors::SafeTensors::open_prefix(dir, "mtp.")?;
+    eprintln!("DSpark weights complete in {}: {} tensors in {} shards", dir.display(), st.tensors.len(), shards.len());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Ref { model, engram, ids, n, dump_logits } => {
@@ -318,6 +452,207 @@ fn main() -> Result<()> {
                 println!("window {w}: {:.1} distinct experts per layer (of {} picks)", tot / cnt, w * m.cfg.top_k);
             }
             println!("generated ids: {seq:?}");
+        }
+        Cmd::FetchMtp { dir, repo, hub } => fetch_mtp(&dir, &repo, &hub)?,
+        #[cfg(feature = "cuda")]
+        Cmd::BenchGemv { iters } => bench_gemv(iters)?,
+        #[cfg(feature = "cuda")]
+        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu, spec, chunk } => {
+            // one or more prompts (';' separated, each comma/whitespace ids or @file), measured in one load
+            let prompts: Vec<(String, Vec<u32>)> = ids
+                .split(';')
+                .filter(|x| !x.trim().is_empty())
+                .enumerate()
+                .map(|(i, part)| -> Result<(String, Vec<u32>)> {
+                    let part = part.trim();
+                    let (name, text) = match part.strip_prefix('@') {
+                        Some(f) => (std::path::Path::new(f).file_stem().map_or(format!("p{i}"), |s| s.to_string_lossy().into_owned()), std::fs::read_to_string(f)?),
+                        None => (format!("p{i}"), part.to_string()),
+                    };
+                    let v = text.split(|ch: char| ch == ',' || ch.is_whitespace()).filter(|x| !x.is_empty()).map(|x| x.parse()).collect::<std::result::Result<Vec<u32>, _>>()?;
+                    Ok((name, v))
+                })
+                .collect::<Result<_>>()?;
+            let t0 = Instant::now();
+            let m = load(&model, engram.as_deref())?;
+            let st = dsx::safetensors::SafeTensors::open_prefix(&mtp, "mtp.")?;
+            let ds = dsx::dspark::Dspark::load(&m, &st, &mtp)?;
+            let chunk = if spec { chunk.max(dsx::handoff::MAXT) } else { 0 };
+            let need = if gpu { dsx::gpumodel::DsparkGpu::estimate_bytes(&mtp)? } else { 0 };
+            let mut gm = dsx::gpumodel::GpuModel::with_placement_draft(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: chunk, rank }, need)?;
+            let pb = gm.pb.take();
+            gm.capture_hidden(&ds.targets)?;
+            let mut dg = if gpu {
+                let tg = Instant::now();
+                let dg = dsx::gpumodel::DsparkGpu::load(&gm, &mtp, Some(gm.draft_gpu))?;
+                eprintln!("DSpark on GPU{}: {:.2} GB in {:.1} s", dg.ordinal, dg.bytes as f64 / 1e9, tg.elapsed().as_secs_f32());
+                Some(dg)
+            } else {
+                None
+            };
+            eprintln!("loaded in {:.1} s; draft block {}, targets {:?}", t0.elapsed().as_secs_f32(), ds.block, ds.targets);
+            for (pname, ids) in &prompts {
+                gm.reset();
+                let cpu_ref = !gpu || check_cpu > 0;
+                let mut dst = ds.new_state(&m);
+                let mut logits = vec![];
+                for &tok in ids {
+                    logits = gm.step(tok)?;
+                    if cpu_ref {
+                        ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                    }
+                    if let Some(dg) = dg.as_mut() {
+                        dg.observe(&gm, gm.pos - 1)?;
+                    }
+                }
+                // the state after the prompt, for the speculative runs below
+                let after_prompt = if spec && gpu { Some((gm.snapshot()?, logits.clone())) } else { None };
+                if let (Some(dg), true) = (dg.as_mut(), spec) {
+                    dg.save_rings(&gm)?;
+                }
+                let (mut cmp_n, mut cmp_same, mut cmp_lead, mut cmp_conf) = (0usize, 0usize, 0usize, 0f64);
+                let (mut drafts, mut seq): (Vec<(usize, Vec<u32>, Vec<f32>)>, Vec<u32>) = (vec![], vec![]);
+                let (mut t_draft, mut t_step) = (0f64, 0f64);
+                for _ in 0..n {
+                    let next = top(&logits, 1)[0].0;
+                    let i = seq.len();
+                    let t = Instant::now();
+                    let (d, cf) = match dg.as_mut() {
+                        Some(dg) => dg.draft(&gm, gm.pos - 1, next)?,
+                        None => ds.draft(&m, &dst, gm.pos - 1, next),
+                    };
+                    t_draft += t.elapsed().as_secs_f64();
+                    if gpu && i < check_cpu {
+                        let (dc, cc) = ds.draft(&m, &dst, gm.pos - 1, next);
+                        cmp_n += 1;
+                        cmp_same += (dc == d) as usize;
+                        cmp_lead += dc.iter().zip(&d).take_while(|(a, b)| a == b).count();
+                        cmp_conf = cmp_conf.max(cc.iter().zip(&cf).map(|(a, b)| (a - b).abs() as f64).fold(0.0, f64::max));
+                        if dc != d {
+                            eprintln!("{pname} draft {i}: gpu {d:?} cpu {dc:?}");
+                        }
+                    }
+                    drafts.push((seq.len() + 1, d, cf));
+                    seq.push(next);
+                    let t = Instant::now();
+                    logits = gm.step(next)?;
+                    t_step += t.elapsed().as_secs_f64();
+                    if cpu_ref && (!gpu || seq.len() < check_cpu) {
+                        ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                    }
+                    if let Some(dg) = dg.as_mut() {
+                        dg.observe(&gm, gm.pos - 1)?;
+                        dg.maintain(&gm)?;
+                    }
+                }
+                // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
+                let scored: Vec<(usize, &Vec<f32>)> = drafts
+                    .iter()
+                    .filter(|(start, d, _)| start + d.len() <= seq.len())
+                    .map(|(start, d, cf)| (d.iter().zip(&seq[*start..]).take_while(|(a, b)| a == b).count(), cf))
+                    .collect();
+                let mut hist = vec![0usize; ds.block + 1];
+                for (a, _) in &scored {
+                    hist[*a] += 1;
+                }
+                let tot = scored.len().max(1) as f64;
+                let mean = scored.iter().map(|(a, _)| *a).sum::<usize>() as f64 / tot;
+                let reach = |i: usize| scored.iter().filter(|(a, _)| *a >= i).count() as f64;
+                let cond: Vec<f64> = (1..=ds.block).map(|i| (reach(i) / reach(i - 1).max(1.0) * 1000.0).round() / 1000.0).collect();
+                println!("[{pname}] dspark: {} drafts scored, accepted histogram {hist:?}, mean {mean:.2} of {}; hit rate per position given the previous hit {cond:?}", scored.len(), ds.block);
+                if cmp_n > 0 {
+                    println!("[{pname}] gpu vs cpu draft: {cmp_same}/{cmp_n} identical, {:.2} of {} leading tokens agree on average, max |conf diff| {cmp_conf:.4}", cmp_lead as f64 / cmp_n as f64, ds.block);
+                }
+                let (step_ms, draft_ms) = (t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64);
+                println!("[{pname}] timing: main step {step_ms:.1} ms/token, {} draft {draft_ms:.2} ms/draft", if gpu { "GPU" } else { "CPU reference" });
+                if let Some(dg) = dg.as_ref() {
+                    let r = dg.prof_report();
+                    if !r.is_empty() {
+                        println!("[{pname}] draft sections ms: {r}");
+                        println!("[{pname}] draft expert picks: {}", dg.usage_report());
+                        println!("[{pname}] draft expert cache: {} swaps so far", dg.swaps);
+                    }
+                }
+                let rows: Vec<String> = scored
+                    .iter()
+                    .map(|(a, cf)| format!("[{a},[{}]]", cf.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",")))
+                    .collect();
+                // speculative decoding for real: draft, one verify pass, keep the accepted prefix, observe it
+                let mut runs: Vec<String> = vec![];
+                if let (Some((snap, lg0)), Some(dg), Some(pb)) = (after_prompt.as_ref(), dg.as_mut(), pb.as_ref()) {
+                    // (name, most drafts per pass, confidence threshold: drafts up to the first one below it)
+                    dg.set_prof(false);
+                    // "auto": SpecControl picks the draft length per token from live costs and hit rates (0 = plain)
+                    let variants: [(&str, usize, Option<f32>); 4] = [("block 3", 3, None), ("block 5", 5, None), ("conf>1", 5, Some(1.0)), ("auto", 0, None)];
+                    for (vname, maxl, thr) in variants {
+                        gm.restore(snap)?;
+                        dg.restore_rings(&gm)?;
+                        let (mut out, mut passes, mut acc, mut steps, mut verified) = (vec![], 0usize, 0usize, 0usize, 0usize);
+                        let mut next = top(lg0, 1)[0].0;
+                        let auto = maxl == 0;
+                        let mut ctl = dsx::spec::SpecControl::new(ds.block);
+                        let t0 = Instant::now();
+                        while out.len() < n {
+                            let room = n - out.len() - 1;
+                            let want = if auto { ctl.choose(room.min(dsx::handoff::MAXT - 1)) } else { maxl.min(room).min(dsx::handoff::MAXT - 1) };
+                            let td = Instant::now();
+                            let (d, cf) = if want > 0 { dg.draft(&gm, gm.pos - 1, next)? } else { (vec![], vec![]) };
+                            let dms = td.elapsed().as_secs_f64() * 1e3;
+                            let mut l = d.len().min(want);
+                            if let Some(th) = thr {
+                                l = l.min(cf.iter().take_while(|&&c| c >= th).count());
+                            }
+                            if l == 0 {
+                                out.push(next);
+                                let ts = Instant::now();
+                                let lg = gm.step(next)?;
+                                ctl.note_step(ts.elapsed().as_secs_f64() * 1e3);
+                                ctl.note_conf(dsx::spec::top_prob(&lg));
+                                dg.observe(&gm, gm.pos - 1)?;
+                                next = top(&lg, 1)[0].0;
+                                steps += 1;
+                                continue;
+                            }
+                            let tv = Instant::now();
+                            let mut toks = vec![next];
+                            toks.extend_from_slice(&d[..l]);
+                            let p0 = gm.pos;
+                            let lv = gm.verify_spec(pb, &toks)?;
+                            let mut j = 0;
+                            while j < l && top(&lv[j], 1)[0].0 == d[j] {
+                                j += 1;
+                            }
+                            gm.keep(1 + j)?;
+                            dg.observe_span(&gm, p0, 0, j + 1)?;
+                            gm.after_pass(1 + j)?;
+                            dg.maintain(&gm)?;
+                            for v in &lv[..=j] {
+                                ctl.note_conf(dsx::spec::top_prob(v));
+                            }
+                            ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
+                            out.push(next);
+                            out.extend_from_slice(&d[..j]);
+                            next = top(&lv[j], 1)[0].0;
+                            passes += 1;
+                            acc += j;
+                            verified += l;
+                        }
+                        let el = t0.elapsed().as_secs_f64();
+                        out.truncate(n);
+                        let same = out.iter().zip(&seq).take_while(|(a, b)| a == b).count();
+                        let tps = n as f64 / el;
+                        println!("[{pname}] spec {vname}: {:.2} tok/s vs plain {:.2} = {:.2}x; {passes} verify passes ({acc}/{verified} drafts accepted), {steps} plain steps; same as plain for the first {same}/{n} tokens", tps, 1e3 / step_ms, tps * step_ms / 1e3);
+                        if auto {
+                            println!("[{pname}]   control: probe gap {}, conf {:.2} (paid at {:.2}), step {:.1} ms, draft {:.1} ms, verify ms by T {:?}, hit {:?}", ctl.probe_gap, ctl.conf, ctl.conf_paid, ctl.step_ms, ctl.draft_ms, ctl.verify_ms.iter().skip(1).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(), ctl.hit.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
+                        }
+                        runs.push(format!("{{\"name\":\"{vname}\",\"tps\":{tps:.3},\"x\":{:.4},\"passes\":{passes},\"accepted\":{acc},\"verified\":{verified},\"steps\":{steps},\"same\":{same}}}", tps * step_ms / 1e3));
+                    }
+                }
+                println!("dspark-json {{\"name\":\"{pname}\",\"block\":{},\"step_ms\":{step_ms:.3},\"draft_ms\":{draft_ms:.3},\"spec\":[{}],\"drafts\":[{}]}}", ds.block, runs.join(","), rows.join(","));
+            }
+            if let Some(dg) = dg.as_ref() {
+                dg.save_heat();
+            }
         }
         #[cfg(feature = "cuda")]
         Cmd::Gen { model, engram, ids, n, ctx, chunk, gpu0_gb, gpu1_gb, arena_gb, check, rank, bench_verify, check_verify, spec } => {
@@ -811,5 +1146,69 @@ fn main() -> Result<()> {
             println!("{} tokens in {el:.1} s ({:.2} tok/s); CPU experts {:.1} s; routed evals main GPU/aux GPUs/CPU {:?}", toks.len(), toks.len() as f64 / el, gm.t_experts, gm.n_routed);
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn bench_gemv(iters: usize) -> Result<()> {
+    use dsx::gpu::{Arg, Gpu};
+    let n = Gpu::count()?;
+    let mut out = vec![];
+    // (label, rows, cols, tokens): attention output / q-sized, a large dense layer, the vocabulary head
+    let shapes: [(&str, usize, usize, usize); 5] = [("attn 5120x8192", 5120, 8192, 1), ("attn 8192x5120", 8192, 5120, 1), ("dense 16384x5120", 16384, 5120, 1), ("head 129280x5120", 129280, 5120, 1), ("head t5", 129280, 5120, 5)];
+    for ord in 0..n {
+        for nofma in [false, true] {
+            if nofma && !dsx::gpu::has_nofma() {
+                continue;
+            }
+            let g = Gpu::new_with(ord, nofma)?;
+            let mut res = serde_json::Map::new();
+            res.insert("gpu".into(), ord.into());
+            res.insert("name".into(), g.name.clone().into());
+            res.insert("nofma".into(), nofma.into());
+            for &(label, rows, cols, t) in &shapes {
+                let w = g.alloc(rows * cols)?;
+                g.memset(w.ptr, rows * cols)?;
+                // f16 scales 2^-8 (bits 0x1c00), activations 0
+                let sc: Vec<u16> = vec![0x1c00; rows * cols / 32];
+                let s = g.upload(&sc)?;
+                let x = g.alloc_zeroed(t * cols * 4)?;
+                let y = g.alloc_zeroed(t * rows * 4)?;
+                let (kn, per) = if t > 1 { ("gemv_q8r4", 16u32) } else { ("gemv_q8r", 4u32) };
+                let k = g.kernel(kn)?;
+                let run = |m: usize| -> Result<f64> {
+                    g.sync()?;
+                    let t0 = Instant::now();
+                    for _ in 0..m {
+                        g.launch(k, ((rows as u32).div_ceil(per), 1, 1), 128, 0, &[Arg::P(w.ptr), Arg::P(x.ptr), Arg::P(y.ptr), Arg::I(rows as i32), Arg::I(cols as i32), Arg::I(t as i32), Arg::I(cols as i32), Arg::I(rows as i32), Arg::P(s.ptr)])?;
+                    }
+                    g.sync()?;
+                    Ok(t0.elapsed().as_secs_f64() / m as f64)
+                };
+                run(5)?;
+                let sec = run(iters)?;
+                let gbs = (rows * cols + rows * cols / 16) as f64 / sec / 1e9;
+                eprintln!("GPU{ord} {}{}: {label}: {:.1} us, {gbs:.0} GB/s", g.name, if nofma { " (no FMA)" } else { "" }, sec * 1e6);
+                res.insert(label.into(), serde_json::json!({"us": sec * 1e6, "gbs": gbs}));
+            }
+            if !nofma {
+                let bytes = 1usize << 30;
+                let a = g.alloc(bytes)?;
+                let b = g.alloc(bytes)?;
+                g.dtod(b.ptr, a.ptr, bytes)?;
+                g.sync()?;
+                let t0 = Instant::now();
+                for _ in 0..10 {
+                    g.dtod(b.ptr, a.ptr, bytes)?;
+                }
+                g.sync()?;
+                let gbs = 2.0 * bytes as f64 * 10.0 / t0.elapsed().as_secs_f64() / 1e9;
+                eprintln!("GPU{ord} {}: device copy {gbs:.0} GB/s (read + write)", g.name);
+                res.insert("copy_gbs".into(), gbs.into());
+            }
+            out.push(serde_json::Value::Object(res));
+        }
+    }
+    println!("gemv-json {}", serde_json::Value::Array(out));
     Ok(())
 }

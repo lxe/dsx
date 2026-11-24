@@ -58,3 +58,5 @@ required-features = ["cuda"]
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# a second kernel image compiled without fused multiply-add, loaded per GPU with DSX_NOFMA (GPUs that throttle FFMA)
+nofma = ["cuda"]

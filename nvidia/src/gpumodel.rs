@@ -8,8 +8,10 @@ use crate::model::{Mat, Model, dot, matvec};
 use crate::numerics::{round_bf16, silu};
 use anyhow::{Context, Result, bail};
 
+mod dspark;
 mod prefill;
 mod vision;
+pub use dspark::DsparkGpu;
 pub use vision::{VisionWeights, encode_image};
 pub use prefill::PrefillBufs;
 use std::collections::HashMap;
@@ -44,7 +46,9 @@ impl DMat {
             return (self.buf.ptr + (r0 * self.cols) as u64, self.scale.as_ref().unwrap().ptr + (r0 * (self.cols / 32) * 2) as u64, 1008);
         }
         let rb = self.ty.row_bytes(self.cols);
-        let sp = self.scale.as_ref().map_or(0, |s| s.ptr + (r0 / 32 * (self.cols / 32)) as u64);
+        // FP8: one scale row per 32 weight rows; FP4: one per weight row
+        let srow = if self.ty == GType::Fp4 { r0 } else { r0 / 32 };
+        let sp = self.scale.as_ref().map_or(0, |s| s.ptr + (srow * (self.cols / 32)) as u64);
         let id = if self.ty == GType::Fp8B32 { 1000 } else { self.ty as u32 as i32 };
         (self.buf.ptr + (r0 * rb) as u64, sp, id)
     }
@@ -108,6 +112,8 @@ pub struct GpuModel<'m> {
     head: DMat,
     out_norm: Buf,
     freqs: (Buf, Buf),
+    /// the GPU `with_placement_draft` set the DSpark stack's room aside on
+    pub draft_gpu: i32,
     // work buffers (T = 1)
     h: Buf,
     x: Buf,
@@ -145,6 +151,13 @@ pub struct GpuModel<'m> {
     comp_src: usize,
     idxk_src: usize,
     topk_rows: Vec<i32>,
+    /// DSpark: layers whose input residual `step` copies aside (`capture_hidden`), and where to
+    hid_layers: Vec<usize>,
+    hid_buf: Option<Buf>,
+    /// DSpark: a prompt pass's residuals of its last <= window rows per target layer ([layer][window][hc][dim]) and
+    /// (first position, rows) of the last pass that wrote them
+    hid_pre: Option<Buf>,
+    pub hid_pre_span: (usize, usize),
     candidates: Vec<bool>,
     engram_hist: Vec<i64>,
     /// routed experts on the CPU pool (GSQ block types); None = reference matvec (FP4 checkpoint)
@@ -191,6 +204,8 @@ pub struct GpuModel<'m> {
     twait: Option<Vec<crate::gpu::Event>>,
     /// one-token Q8_0 GEMVs on gemv_q8r1 (DSX_Q8R1=0: gemv_q8r, for A/Bs)
     q8r1: bool,
+    /// multi-token Q8_0 GEMVs (verify passes, drafts) on gemv_q8r4: with DSpark only (`draft` > 0), DSX_Q8R4=1/0 forces it
+    q8r4: bool,
     /// one-token split-k GEMVs on the *_sk1 kernels (DSX_SK1=0: the generic ones, for A/Bs)
     sk1: bool,
     /// one-token deferred decode: injection + post-weights copy inside the combine launch (DSX_COMBINE_FUSED=0: separate)
@@ -277,7 +292,9 @@ pub struct GpuInfo {
 /// Every visible GPU (DSX_GPUS="0,2" limits them): memory and measured host -> device bandwidth.
 pub fn probe_gpus() -> Result<Vec<GpuInfo>> {
     let only: Option<Vec<i32>> = std::env::var("DSX_GPUS").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-    let gs: Vec<Gpu> = (0..Gpu::count()?).filter(|i| only.as_ref().is_none_or(|o| o.contains(i))).map(Gpu::new).collect::<Result<_>>()?;
+    let ords: Vec<i32> = (0..Gpu::count()?).filter(|i| only.as_ref().is_none_or(|o| o.contains(i))).collect();
+    crate::gpu::pick_kernels(&ords)?;
+    let gs: Vec<Gpu> = ords.iter().map(|&o| Gpu::new(o)).collect::<Result<_>>()?;
     let Some(g0) = gs.first() else { bail!("no CUDA devices") };
     g0.bind();
     let stage = crate::gpu::HostBuf::new(64 << 20)?;
@@ -285,8 +302,14 @@ pub fn probe_gpus() -> Result<Vec<GpuInfo>> {
 }
 
 /// The main GPU (dense weights, KV, prefill, the expert cache that swaps): the best host link, within 15%, then
-/// the most memory.
+/// the most memory. DSX_MAIN_GPU=<ordinal> picks one (for comparisons: a GPU with faster memory but a slower host link).
 pub fn pick_main(gpus: &[GpuInfo]) -> i32 {
+    if let Some(o) = std::env::var("DSX_MAIN_GPU").ok().and_then(|v| v.trim().parse::<i32>().ok()) {
+        if gpus.iter().any(|g| g.ordinal == o) {
+            return o;
+        }
+        eprintln!("DSX_MAIN_GPU={o}: no such GPU, picking by host link");
+    }
     let best = gpus.iter().map(|g| g.h2d_gbs).fold(0.0, f64::max);
     gpus.iter().filter(|g| g.h2d_gbs >= 0.85 * best).max_by_key(|g| g.total).map_or(0, |g| g.ordinal)
 }
@@ -311,7 +334,7 @@ pub struct Placement {
 pub const KERNELS: &[&str] = &[
     "gemv_q8_0", "gemv_f16", "gemv_f32", "rmsnorm", "round_bf16", "rope", "fake_fp8", "fake_fp4", "hc_mixes", "hc_pre",
     "hc_post", "sparse_attn", "sparse_attn_tile", "sparse_attn_merge", "store_bf16", "indexer_score", "compress_pool", "router_topk", "swiglu", "add_inplace",
-    "engram_gate", "scale_bf16", "gemv_fp8b32", "gemv_fp8b32_o", "gemv_bf16", "fake_fp8_copy", "gemv_q2_0", "gemv_ptq1_0", "gemv_q3_k", "publish_route", "combine_experts", "spin_wait", "rope_pos", "compress_pairs", "gather_f16", "swiglu_rows_f16", "scatter_add", "engram_gate_t", "dequant_f16", "dequant_f16_iq8", "dequant_t16_f16", "t16_pre", "t16_post", "to_f16", "ring_scatter", "pack_f16", "gemv_q8r", "gemv_q8r4", "hc_dots", "hc_dots_t", "hc_finish", "hc_finish_w", "gemv_q8g", "hc_pre_mb", "hc_post_mb", "to_bf16", "gemv_q8r_sk", "gemv_f16_sk", "gemv_bf16_sk", "gemv_f32_sk", "hc_part", "hc_reduce", "gemv_q6p", "dequant_q6p_f16", "gemv_q5p", "dequant_q5p_f16", "gemv_q6g4", "gemv_q6g8", "gemv_q6s8", "gemv_q5p4",
+    "engram_gate", "scale_bf16", "gemv_fp8b32", "gemv_fp8b32_o", "gemv_fp4", "dsp_argmax_add", "gemv_fp4_sel", "dsp_moe_sum", "dsp_gather_bf16", "dsp_count", "gemv_bf16", "fake_fp8_copy", "gemv_q2_0", "gemv_ptq1_0", "gemv_q3_k", "publish_route", "combine_experts", "spin_wait", "rope_pos", "compress_pairs", "gather_f16", "swiglu_rows_f16", "scatter_add", "engram_gate_t", "dequant_f16", "dequant_f16_iq8", "dequant_t16_f16", "t16_pre", "t16_post", "to_f16", "ring_scatter", "pack_f16", "gemv_q8r", "gemv_q8r4", "hc_dots", "hc_dots_t", "hc_finish", "hc_finish_w", "gemv_q8g", "hc_pre_mb", "hc_post_mb", "to_bf16", "gemv_q8r_sk", "gemv_f16_sk", "gemv_bf16_sk", "gemv_f32_sk", "hc_part", "hc_reduce", "gemv_q6p", "dequant_q6p_f16", "gemv_q5p", "dequant_q5p_f16", "gemv_q6g4", "gemv_q6g8", "gemv_q6s8", "gemv_q5p4",
     "fwht_rows_f16", "hc_reduce_finish", "kv_norm_rope_store", "add_noise_rows", "hc_add_post", "hc_pre_norm", "router_publish", "gemv_q8r1", "gemv_bf16_sk1", "gemv_f16_sk1", "gemv_q8r_sk1", "combine_post", "gemv_q8g_bf", "gemv_q8r_gu", "sparse_attn_merge_rf", "gemv_q8r1_rope", "gemv_q8r1_post", "vit_rmsnorm", "vit_bias_add", "vit_rope_split", "vit_softmax", "vit_heads_merge", "vit_swiglu", "vit_unfold3", "vit_gelu_bias", "vit_to_bf16",
 ];
 
@@ -327,6 +350,14 @@ impl<'m> GpuModel<'m> {
     /// `ordinal` < 0: pick the main GPU by measurement (pick_main); every other GPU becomes an aux expert store
     /// unless `pl.aux_gb` is 0.
     pub fn with_placement(m: &'m Model, ordinal: i32, max_ctx: usize, pl: Placement) -> Result<GpuModel<'m>> {
+        Self::with_placement_draft(m, ordinal, max_ctx, pl, 0)
+    }
+
+    /// `with_placement`, leaving `draft` bytes for the DSpark stack on one GPU before experts fill them: the aux GPU
+    /// with the most expert room when the stack takes at most a quarter of it (an aux GPU holds colder experts than
+    /// the main one, and the draft then runs beside the main GPU instead of taking its memory), else the main GPU.
+    /// DSX_DSPARK_GPU=<ordinal> picks one. The choice is `draft_gpu`.
+    pub fn with_placement_draft(m: &'m Model, ordinal: i32, max_ctx: usize, pl: Placement, draft: usize) -> Result<GpuModel<'m>> {
         let probe = if ordinal < 0 || pl.aux_gb != 0.0 { probe_gpus()? } else { vec![] };
         let ordinal = if ordinal >= 0 { ordinal } else { pick_main(&probe) };
         if probe.len() > 1 {
@@ -515,6 +546,7 @@ impl<'m> GpuModel<'m> {
             tev0: None,
             twait: None,
             q8r1: std::env::var("DSX_Q8R1").map_or(true, |v| v != "0"),
+            q8r4: std::env::var("DSX_Q8R4").map_or(draft > 0, |v| v != "0"),
             sk1: std::env::var("DSX_SK1").map_or(true, |v| v != "0"),
             combine_fused: std::env::var("DSX_COMBINE_FUSED").map_or(true, |v| v != "0"),
             fuse2: std::env::var("DSX_FUSE2").map_or(true, |v| v != "0"),
@@ -552,6 +584,10 @@ impl<'m> GpuModel<'m> {
             comp_src: usize::MAX,
             idxk_src: usize::MAX,
             topk_rows: vec![],
+            hid_layers: vec![],
+            hid_buf: None,
+            hid_pre: None,
+            hid_pre_span: (0, 0),
             candidates: vec![],
             engram_hist: vec![],
             cpu_moe: if matches!(m.src, crate::model::Source::Gguf(_)) {
@@ -567,6 +603,7 @@ impl<'m> GpuModel<'m> {
             t_experts: 0.0,
             exp0: None,
             aux: vec![],
+            draft_gpu: -1,
             n_routed: [0; 3],
             ev0: vec![],
             evprof: None,
@@ -581,7 +618,7 @@ impl<'m> GpuModel<'m> {
         }
         // prefill buffers before the experts take the rest of VRAM
         gm.pb = Some(PrefillBufs::new(&gm.g, m, pl.prefill_chunk, max_ctx)?);
-        let gpu0_bytes = if pl.gpu0_gb < 0.0 {
+        let mut gpu0_bytes = if pl.gpu0_gb < 0.0 {
             let (free, _) = gm.g.mem_info()?;
             free.saturating_sub((-pl.gpu0_gb * 1e9) as usize)
         } else {
@@ -623,6 +660,28 @@ impl<'m> GpuModel<'m> {
                     }
                 }
             }
+        }
+        gm.draft_gpu = gm.g.ordinal;
+        if draft > 0 {
+            let want = std::env::var("DSX_DSPARK_GPU").ok().and_then(|v| v.trim().parse::<i32>().ok());
+            // on an aux GPU the stack also needs a copy of the main head, its own kernel module and scratch
+            let aux_need = draft + gm.head.buf.bytes + gm.head.scale.as_ref().map_or(0, |s| s.bytes) + (512 << 20);
+            let pick = match want {
+                Some(o) => aux_g.iter().position(|a| a.0.ordinal == o && a.1 >= aux_need),
+                None => aux_g.iter().enumerate().filter(|(_, a)| a.1 >= 4 * aux_need).max_by_key(|(_, a)| a.1).map(|(i, _)| i),
+            };
+            let set = match pick {
+                Some(i) => {
+                    aux_g[i].1 -= aux_need;
+                    gm.draft_gpu = aux_g[i].0.ordinal;
+                    aux_need
+                }
+                None => {
+                    gpu0_bytes = gpu0_bytes.saturating_sub(draft);
+                    draft
+                }
+            };
+            eprintln!("DSpark draft: GPU{} ({:.2} GB set aside)", gm.draft_gpu, set as f64 / 1e9);
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
         // automatic tiering (tier.rs): what this machine learned in earlier runs with this model (and overlay), if anything
@@ -1670,6 +1729,7 @@ impl<'m> GpuModel<'m> {
             // arithmetic, bit-identical to the F16 path
             GType::Fp8B32 if !w.act_fp8 => "gemv_fp8b32_o",
             GType::Fp8B32 => "gemv_fp8b32",
+            GType::Fp4 => "gemv_fp4",
             GType::Q2_0 => "gemv_q2_0",
             GType::Ptq1_0 => "gemv_ptq1_0",
             GType::Q3K => "gemv_q3_k",
@@ -1687,6 +1747,10 @@ impl<'m> GpuModel<'m> {
         // few rows: one block per row with the warps splitting k (measured faster below ~2K rows)
         let sk = n < 2048 && matches!(kname, "gemv_q8r" | "gemv_f16" | "gemv_bf16" | "gemv_f32");
         let kname = if sk { match kname { "gemv_q8r" => "gemv_q8r_sk", "gemv_f16" => "gemv_f16_sk", "gemv_bf16" => "gemv_bf16_sk", _ => "gemv_f32_sk" } } else { kname };
+        // several tokens (verify passes, DSpark drafts): 4 rows per warp share each x load; at 1 row per warp the x reads
+        // are T times the weight bytes (the 129K-row head: 3.4 ms for 5 rows). With DSpark only (`q8r4`): it changes the
+        // summation order, so prefill chunks without --dspark keep main's numerics
+        let kname = if kname == "gemv_q8r" && t > 1 && n % 16 == 0 && self.q8r4 { "gemv_q8r4" } else { kname };
         // one token: gemv_q8r without the MAXT accumulators (bit-identical, more warps per SM)
         let kname = if kname == "gemv_q8r" && t == 1 && self.q8r1 { "gemv_q8r1" } else { kname };
         // one token, few rows: the split-k kernels without MAXT accumulators (bit-identical)
@@ -1696,7 +1760,7 @@ impl<'m> GpuModel<'m> {
             "gemv_q8r_sk" if t == 1 && self.sk1 => "gemv_q8r_sk1",
             k => k,
         };
-        let per_block = if sk { 1 } else if matches!(kname, "gemv_q8r4" | "gemv_fp8b32") { 16 } else { 4 };
+        let per_block = if sk { 1 } else if matches!(kname, "gemv_q8r4" | "gemv_fp8b32" | "gemv_fp4") { 16 } else { 4 };
         self.g.launch(
             self.k[kname],
             ((n as u32).div_ceil(per_block), 1, 1),
@@ -2169,6 +2233,51 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
+    /// DSpark: from now on every `step` (row 0) and every verify pass (row t per token) copies the residual entering
+    /// each of `layers` aside ([layer][MAXT][hc][dim]); `main_hidden` and DsparkGpu::observe_row read it.
+    pub fn capture_hidden(&mut self, layers: &[usize]) -> Result<()> {
+        let c = &self.m.cfg;
+        self.hid_buf = if layers.is_empty() { None } else { Some(self.g.alloc(layers.len() * crate::handoff::MAXT * c.hc * c.dim * 4)?) };
+        self.hid_pre = if layers.is_empty() || self.pb.is_none() { None } else { Some(self.g.alloc(layers.len() * c.window * c.hc * c.dim * 4)?) };
+        self.hid_pre_span = (0, 0);
+        self.hid_layers = layers.to_vec();
+        Ok(())
+    }
+
+    /// The last step's captured residuals as DSpark's `main_hidden`: per layer the mean over the hc streams, BF16-rounded.
+    pub fn main_hidden(&self) -> Result<Vec<f32>> {
+        let (c, b) = (&self.m.cfg, self.hid_buf.as_ref().context("capture_hidden not called")?);
+        let (d, hc) = (c.dim, c.hc);
+        let raw: Vec<f32> = self.g.download(b.ptr, self.hid_layers.len() * crate::handoff::MAXT * hc * d)?;
+        Ok(raw
+            .chunks(crate::handoff::MAXT * hc * d)
+            .map(|c| &c[..hc * d])
+            .flat_map(|h| (0..d).map(move |i| crate::numerics::round_bf16((0..hc).map(|k| h[k * d + i]).sum::<f32>() / hc as f32)))
+            .collect())
+    }
+
+    /// After a speculative verify pass and `keep(k)`: the between-token work `step` does after its logits (expert
+    /// exchanges, tiering moves and bookkeeping), so placement keeps adapting while most tokens come from passes.
+    pub fn after_pass(&mut self, k: usize) -> Result<()> {
+        self.tier_tokens += k as u64;
+        if self.adapt > 0 || self.tier_swap {
+            self.adapt_commit()?;
+            if self.adapt > 0 {
+                self.adapt_step()?;
+            }
+        }
+        if self.tier_swap && self.tier_tokens % crate::tier::WORK_MOVE_EVERY < k as u64 {
+            self.tier_step_logged(false);
+        }
+        self.tier_collect()?;
+        if let Some(w) = self.worker.as_ref() {
+            for (i, v) in self.adapt_flags.drain(..) {
+                w.on_cpu[i].store(v, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
         let t_step = std::time::Instant::now();
         // DSX_ADAPT_EARLY=1: scan and start replacements before the sync (off: window 30 measured the same swap count but
@@ -2318,6 +2427,11 @@ impl<'m> GpuModel<'m> {
                 }
                 self.engram(li, eidx)?;
                 self.mark(&mut tm, "engram")?;
+            }
+            if let (Some(k), Some(b)) = (self.hid_layers.iter().position(|&x| x == li), self.hid_buf.as_ref()) {
+                // DSpark reads the residual entering this layer's attention (after Engram), as the CPU reference
+                let row = c.hc * d * 4;
+                self.g.dtod(b.ptr + (k * crate::handoff::MAXT * row) as u64, self.h.ptr, row)?;
             }
             self.ev(li, 8)?;
             // attention half: mixes for this sublayer; input collapsed with the previous FFN's pre

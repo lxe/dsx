@@ -43,6 +43,12 @@ struct Cli {
     /// Off unless set here or through DSX_DEFER=R.
     #[arg(long)]
     defer_rank: Option<usize>,
+    /// checkpoint directory with DSpark's `mtp.*` shards (`dsx fetch-mtp DIR` downloads only those): speculative
+    /// decoding, off unless given. Drafts only while the answer repeats its prompt or itself, and only while that
+    /// measures faster; its stack (several GB, DSX_DSPARK_SLOTS) is set aside before the experts are placed, on an aux GPU with room for it
+    /// or else the main GPU. See docs/dspark.md.
+    #[arg(long)]
+    dspark: Option<std::path::PathBuf>,
     /// run the deterministic mock engine instead of the model
     #[arg(long)]
     mock: bool,
@@ -213,6 +219,7 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
         cache_sessions: cli.cache_sessions,
         session_cache_gb: cli.session_cache_gb,
         prefix_anchor_tokens: cli.prefix_anchor_tokens,
+        dspark: cli.dspark.clone(),
     };
     EngineHandle::spawn(move || dsx::server::real::real_engine(&args))
 }

@@ -20,6 +20,11 @@ fn fix_scales(ty: GType, w: &mut [u8]) {
     }
 }
 
+/// DSX_BENCH_GPU=<ordinal>: the GPU to measure (default 0)
+fn bench_gpu() -> i32 {
+    std::env::var("DSX_BENCH_GPU").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
 fn time(g: &Gpu, n: usize, mut f: impl FnMut()) -> f64 {
     f();
     g.sync().unwrap();
@@ -37,7 +42,7 @@ const FORMATS: [(GType, Option<&str>); 7] =
 #[test]
 #[ignore]
 fn expert_gemv_speed() {
-    let g = Gpu::new(0).unwrap();
+    let g = Gpu::new(bench_gpu()).unwrap();
     let mut seed = 1u64;
     eprintln!("{} ({} SMs): GB/s of weight bytes, old GGUF-block kernel vs repacked fast kernel (int8 x, dp4a)", g.name, g.sms);
     // six experts' gate rows back to back; six experts' down rows
@@ -90,12 +95,12 @@ fn expert_gemv_speed() {
 #[test]
 #[ignore]
 fn expert_moe_speed() {
-    let g = Gpu::new(0).unwrap();
+    let g = Gpu::new(bench_gpu()).unwrap();
     let mut seed = 7u64;
     // the same six experts in enough layers (>= 256 MB) that cycling through them defeats L2
     let nl = 6;
     let c = ExpCfg { n_layers: nl, n_experts: 8, inter: 2304, dim: 5120, lim: 10.0, rot: 0 };
-    eprintln!("{}: 6 resident experts (gate+up+down), us per layer and GB/s of expert bytes read", g.name);
+    eprintln!("{} ({} SMs, KS {}, ROWT {}): 6 resident experts (gate+up+down), us per layer and GB/s of expert bytes read", g.name, g.sms, dsx::experts::KS, dsx::experts::ROWT);
     for (gu, dn) in [(GType::Q2_0, GType::Q2_0), (GType::Ptq1_0, GType::Ptq1_0), (GType::Q3K, GType::Q3K), (GType::Iq2Xxs, GType::Iq2Xxs), (GType::Iq1S, GType::Iq1S), (GType::Iq2Xs, GType::Iq2Xs), (GType::Iq2S, GType::Iq2S)] {
         if std::env::var("DSX_BENCH_FMT").is_ok_and(|f| f != format!("{gu:?}")) {
             continue;
