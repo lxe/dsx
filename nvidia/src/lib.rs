@@ -18,6 +18,8 @@ pub mod gpumodel;
 pub mod handoff;
 /// Bounded host cache arena for parked conversation lineages (no CUDA dependency of its own).
 pub mod hostcache;
+/// Automatic expert tiering across media (learned use, persistent state, idle warming, SSD buffer for HDD models).
+pub mod tier;
 pub mod q6;
 pub mod spec;
 #[cfg(feature = "cuda")]
