@@ -97,6 +97,8 @@ pub struct GpuExperts {
     /// per layer: (gate / up, down) bits x 2 when the layer's experts are T16
     t16: Vec<Option<(usize, usize)>>,
     t16b: Option<T16Bufs>,
+    /// k-splits of this store's T16 decode GEMVs (gate/up, down), see `t16_split`
+    t16_split: (usize, usize),
 }
 
 /// An expert replacing a same-type victim in place: its raw matrices go to a staging buffer and are repacked into the
@@ -234,6 +236,36 @@ impl T16Bufs {
 /// harnesses (src/bin/t16-decode-*.rs) link these so their launches cannot drift from the engine's split counts
 pub const T16_SGU: usize = 4;
 pub const T16_SD: usize = 3;
+/// the most k-splits `DSX_T16_SPLIT` may ask for (gate/up, down)
+pub const T16_SGU_MAX: usize = 10;
+pub const T16_SD_MAX: usize = 9;
+
+/// How a GPU's T16 decode GEMVs split their k groups.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum T16Split {
+    Fixed(usize, usize),
+    /// time the candidates once at startup on this store's residents (`DSX_T16_SPLIT=auto`)
+    Auto,
+}
+
+/// The decode k-splits for a GPU of compute capability `arch` (major*10+minor), from `DSX_T16_SPLIT`:
+/// unset = the GPU's default, `0` = T16_SGU / T16_SD (main's numerics on every GPU), `GU,D` = both for every GPU,
+/// `auto` = timed once at startup. The default is 3/1 on sm_86 (RTX 3090: an expert layer 149.7 -> 140.9 us and
+/// 132 -> 123 us on two boxes, same choice when timed), T16_SGU / T16_SD elsewhere. A split changes the order the
+/// per-split float partial sums are added, not the integer dot products, so outputs can differ in the last bits.
+fn t16_split(arch: u32, env: Option<&str>) -> Result<T16Split> {
+    Ok(match env.map(str::trim) {
+        None | Some("") if arch == 86 => T16Split::Fixed(3, 1),
+        None | Some("") => T16Split::Fixed(T16_SGU, T16_SD),
+        Some("0") => T16Split::Fixed(T16_SGU, T16_SD),
+        Some("auto") => T16Split::Auto,
+        Some(v) => {
+            let p: Vec<usize> = v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>().map_err(|_| anyhow::anyhow!("DSX_T16_SPLIT={v}: expected GU,D, 0 or auto"))?;
+            anyhow::ensure!(p.len() == 2 && (1..=T16_SGU_MAX).contains(&p[0]) && (1..=T16_SD_MAX).contains(&p[1]), "DSX_T16_SPLIT={v}: expected GU,D with GU in 1..={T16_SGU_MAX}, D in 1..={T16_SD_MAX}");
+            T16Split::Fixed(p[0], p[1])
+        }
+    })
+}
 
 /// Type id of `t` repacked for the fast kernels (expert_fast.cuh), the same bytes per weight.
 pub fn repacked_id(t: GType) -> Result<i32> {
@@ -352,6 +384,13 @@ impl GpuExperts {
                 anyhow::ensure!(!is_t16(x.gu) && !is_t16(x.dn), "layer {l}: T16 mixed with other expert types");
             }
         }
+        let split = t16_split(g.arch, std::env::var("DSX_T16_SPLIT").ok().as_deref())?;
+        // scratch for the split in use (main's sizes with 4/3); `auto` tries up to the maxima
+        let (sgu, sd) = match split {
+            T16Split::Fixed(a, b) => (a.clamp(1, (c.dim / 256).max(1)), b.clamp(1, (c.inter / 256).max(1))),
+            T16Split::Auto => (T16_SGU, T16_SD),
+        };
+        let (cgu, cd) = if split == T16Split::Auto { (T16_SGU_MAX, T16_SD_MAX) } else { (sgu, sd) };
         let t16b = if t16.iter().any(|v| v.is_some()) {
             for n in ["t16d_prep", "t16d_gemv_3", "t16d_gemv_4", "t16d_gemv_5", "t16d_gemv0_3", "t16d_gemv0_4", "t16d_gemv0_5", "t16d_post_gu", "t16d_post_down"] {
                 k.insert(n, g.kernel(n)?);
@@ -368,9 +407,9 @@ impl GpuExperts {
                 xsu: f4(p * d / 256)?,
                 xdd: f4(p * i / 256)?,
                 xsd: f4(p * i / 256)?,
-                pg: f4(T16_SGU * p * i)?,
-                pu: f4(T16_SGU * p * i)?,
-                pd: f4(T16_SD * p * d)?,
+                pg: f4(cgu * p * i)?,
+                pu: f4(cgu * p * i)?,
+                pd: f4(cd * p * d)?,
                 h: f4(p * i)?,
             })
         } else {
@@ -395,7 +434,7 @@ impl GpuExperts {
             None
         };
         let smem = slots.values().flat_map(|s| [tile_smem(s.gu), tile_smem(s.dn)]).max().unwrap_or(0);
-        Ok(GpuExperts {
+        let mut s = GpuExperts {
             buf,
             tab,
             sel: g.alloc_zeroed(4 * MAXT * MAXK)?,
@@ -420,7 +459,93 @@ impl GpuExperts {
             swap: None,
             t16,
             t16b,
-        })
+            t16_split: (sgu, sd),
+        };
+        if s.t16b.is_some() {
+            if split == T16Split::Auto {
+                s.tune_t16_split(g)?;
+            } else if (sgu, sd) != (T16_SGU, T16_SD) {
+                eprintln!("GPU{}: T16 decode splits {sgu}/{sd} (DSX_T16_SPLIT=0 for {T16_SGU}/{T16_SD})", g.ordinal);
+            }
+        }
+        Ok(s)
+    }
+
+    /// `DSX_T16_SPLIT=auto`: time one decode token's T16 layer on this store's residents (after a 300 ms warm-up,
+    /// candidates interleaved over three rounds) and keep another split than T16_SGU / T16_SD only when it is at least
+    /// 3 % faster. Timing near that threshold can choose differently on another start, so the default is a fixed split
+    /// per GPU (`t16_split`); this is for finding one on a new GPU.
+    fn tune_t16_split(&mut self, g: &Gpu) -> Result<()> {
+        let (ggu, gd) = (self.dim / 256, self.inter / 256);
+        let clamp = |(a, b): (usize, usize)| (a.clamp(1, T16_SGU_MAX.min(ggu)), b.clamp(1, T16_SD_MAX.min(gd)));
+        // the T16 layer with the most residents here, up to six of its experts as one token's picks
+        let mut per: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &(l, e) in self.slots.keys() {
+            if self.is_t16_layer(l) {
+                per.entry(l).or_default().push(e);
+            }
+        }
+        let Some((l, mut es)) = per.into_iter().max_by_key(|(l, v)| (v.len(), usize::MAX - l)) else { return Ok(()) };
+        es.sort_unstable();
+        es.truncate(6.min(MAXK));
+        let k = es.len();
+        let (kg, kd) = self.t16[l].unwrap();
+        let sel: Vec<i32> = es.iter().map(|&e| e as i32).collect();
+        g.htod_sync(self.sel.ptr, &sel)?;
+        g.htod_sync(self.wts.ptr, &vec![1.0f32 / k as f32; k])?;
+        let mut s = 0x9e3779b9u32;
+        let x: Vec<f32> = (0..self.dim)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32 - 0.5) * 2.0
+            })
+            .collect();
+        g.htod_sync(self.x.ptr, &x)?;
+        let b = self.t16b.as_ref().unwrap().ptrs();
+        let run = |sp: (usize, usize)| self.run_t16_on(g, l, self.sel.ptr, self.wts.ptr, k, 1, self.x.ptr, self.out.ptr, kg, kd, &b, sp);
+        let t0 = std::time::Instant::now();
+        while t0.elapsed().as_millis() < 300 {
+            for _ in 0..20 {
+                run((T16_SGU, T16_SD))?;
+            }
+            g.sync()?;
+        }
+        let (e0, e1) = (g.timed_event()?, g.timed_event()?);
+        let time = |sp: (usize, usize)| -> Result<f32> {
+            g.record(e0, false)?;
+            for _ in 0..40 {
+                run(sp)?;
+            }
+            g.record(e1, false)?;
+            g.event_sync(e1)?;
+            Ok(g.elapsed_ms(e0, e1)? / 40.0)
+        };
+        let best = |cands: Vec<(usize, usize)>| -> Result<Vec<((usize, usize), f32)>> {
+            let mut c: Vec<((usize, usize), f32)> = cands.into_iter().map(clamp).map(|p| (p, f32::INFINITY)).collect();
+            c.dedup_by_key(|x| x.0);
+            for _ in 0..3 {
+                for x in c.iter_mut() {
+                    x.1 = x.1.min(time(x.0)?);
+                }
+            }
+            Ok(c)
+        };
+        let gu = best([2, 3, 4, 5, 7, 10].iter().map(|&a| (a, T16_SD)).collect())?;
+        let bgu = gu.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0.0;
+        let mut all = best([1, 2, 3, 5, 9].iter().map(|&d| (bgu, d)).chain([(T16_SGU, T16_SD)]).collect())?;
+        all.extend(gu);
+        let def = all.iter().filter(|x| x.0 == (T16_SGU, T16_SD)).map(|x| x.1).fold(f32::INFINITY, f32::min);
+        let (bp, bt) = all.iter().copied().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        if bt * 1.03 <= def {
+            self.t16_split = bp;
+        }
+        eprintln!(
+            "GPU{} (sm_{}): T16 expert layer {:.1} us with splits {}/{}, {:.1} us with {}/{}: {}/{} (set DSX_T16_SPLIT={},{} to keep it)",
+            g.ordinal, g.arch, def * 1e3, T16_SGU, T16_SD, bt * 1e3, bp.0, bp.1, self.t16_split.0, self.t16_split.1, self.t16_split.0, self.t16_split.1
+        );
+        Ok(())
     }
 
     /// Allow up to `n` in-flight replacements (fast layout only), each staging at most `max_raw` bytes.
@@ -662,7 +787,7 @@ impl GpuExperts {
     #[allow(clippy::too_many_arguments)]
     fn run_t16(&self, g: &Gpu, l: usize, sel: u64, wts: u64, k: usize, t: usize, x: u64, out: u64, kg: usize, kd: usize) -> Result<()> {
         let b = self.t16b.as_ref().unwrap().ptrs();
-        self.run_t16_on(g, l, sel, wts, k, t, x, out, kg, kd, &b)
+        self.run_t16_on(g, l, sel, wts, k, t, x, out, kg, kd, &b, self.t16_split)
     }
 
     /// whether layer `l`'s experts here are T16 (run_t16_ext applies)
@@ -677,11 +802,11 @@ impl GpuExperts {
     pub fn run_t16_ext(&self, g: &Gpu, l: usize, sel: u64, wts: u64, k: usize, t: usize, x: u64, out: u64, scratch: u64) -> Result<()> {
         let Some((kg, kd)) = self.t16[l] else { bail!("run_t16_ext: layer {l} is not T16") };
         let b = T16Ptrs::carve(scratch, t * k, self.dim, self.inter);
-        self.run_t16_on(g, l, sel, wts, k, t, x, out, kg, kd, &b)
+        self.run_t16_on(g, l, sel, wts, k, t, x, out, kg, kd, &b, (T16_SGU, T16_SD))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_t16_on(&self, g: &Gpu, l: usize, sel: u64, wts: u64, k: usize, t: usize, x: u64, out: u64, kg: usize, kd: usize, b: &T16Ptrs) -> Result<()> {
+    fn run_t16_on(&self, g: &Gpu, l: usize, sel: u64, wts: u64, k: usize, t: usize, x: u64, out: u64, kg: usize, kd: usize, b: &T16Ptrs, (sgu, sd): (usize, usize)) -> Result<()> {
         let (dim, inter, picks) = (self.dim, self.inter, t * k);
         let (tab, base, e) = (Arg::P(self.tab.ptr), Arg::P(self.buf.ptr), Arg::I(self.n_experts as i32));
         let (li, ki, ti) = (Arg::I(l as i32), Arg::I(k as i32), Arg::I(t as i32));
@@ -694,12 +819,12 @@ impl GpuExperts {
             g.launch(self.k["t16d_prep"], blocks(picks * dim / 256), 128, 0, &[Arg::P(x), Arg::I(0), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(role), Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(kg as i32), Arg::P(xp), Arg::P(xd), Arg::P(xs)])?;
         }
         for (role, xp, xd, xs, part) in [(0, b.xpg, b.xdg, b.xsg, b.pg), (1, b.xpu, b.xdu, b.xsu, b.pu)] {
-            g.launch(gemv(kg), blocks(picks * inter / 32 * T16_SGU), 128, 0, &[Arg::P(xp), Arg::P(xd), Arg::P(xs), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(role), Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(T16_SGU as i32), Arg::P(part)])?;
+            g.launch(gemv(kg), blocks(picks * inter / 32 * sgu), 128, 0, &[Arg::P(xp), Arg::P(xd), Arg::P(xs), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(role), Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(sgu as i32), Arg::P(part)])?;
         }
-        g.launch(self.k["t16d_post_gu"], blocks(picks * inter / 128), 128, 0, &[Arg::P(b.pg), Arg::P(b.pu), Arg::I(T16_SGU as i32), Arg::P(sel), Arg::P(wts), tab, base, li, e, ki, ti, Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(kg as i32), Arg::F(self.lim), Arg::P(b.h)])?;
+        g.launch(self.k["t16d_post_gu"], blocks(picks * inter / 128), 128, 0, &[Arg::P(b.pg), Arg::P(b.pu), Arg::I(sgu as i32), Arg::P(sel), Arg::P(wts), tab, base, li, e, ki, ti, Arg::I(dim as i32), Arg::I(inter as i32), Arg::I(kg as i32), Arg::F(self.lim), Arg::P(b.h)])?;
         g.launch(self.k["t16d_prep"], blocks(picks * inter / 256), 128, 0, &[Arg::P(b.h), Arg::I(1), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(2), Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(kd as i32), Arg::P(b.xpd), Arg::P(b.xdd), Arg::P(b.xsd)])?;
-        g.launch(gemv(kd), blocks(picks * dim / 32 * T16_SD), 128, 0, &[Arg::P(b.xpd), Arg::P(b.xdd), Arg::P(b.xsd), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(2), Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(T16_SD as i32), Arg::P(b.pd)])?;
-        g.launch(self.k["t16d_post_down"], blocks(t * dim / 128), 128, 0, &[Arg::P(b.pd), Arg::I(T16_SD as i32), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(kd as i32), Arg::P(out)])
+        g.launch(gemv(kd), blocks(picks * dim / 32 * sd), 128, 0, &[Arg::P(b.xpd), Arg::P(b.xdd), Arg::P(b.xsd), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(2), Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(sd as i32), Arg::P(b.pd)])?;
+        g.launch(self.k["t16d_post_down"], blocks(t * dim / 128), 128, 0, &[Arg::P(b.pd), Arg::I(sd as i32), Arg::P(sel), tab, base, li, e, ki, ti, Arg::I(inter as i32), Arg::I(dim as i32), Arg::I(kd as i32), Arg::P(out)])
     }
 }
 
@@ -916,5 +1041,24 @@ impl Arena {
         let s = self.slots.get(&(l, e))?;
         let b = self.buf.as_slice::<u8>();
         Some([&b[s[0].0..s[0].0 + s[0].1], &b[s[1].0..s[1].0 + s[1].1], &b[s[2].0..s[2].0 + s[2].1]])
+    }
+}
+
+#[cfg(test)]
+mod t16_split_tests {
+    use super::{T16_SD, T16_SGU, T16Split, t16_split};
+
+    #[test]
+    fn defaults_and_overrides() {
+        assert_eq!(t16_split(86, None).unwrap(), T16Split::Fixed(3, 1));
+        assert_eq!(t16_split(80, None).unwrap(), T16Split::Fixed(T16_SGU, T16_SD));
+        assert_eq!(t16_split(120, None).unwrap(), T16Split::Fixed(T16_SGU, T16_SD));
+        // 0 restores main's split on every GPU
+        assert_eq!(t16_split(86, Some("0")).unwrap(), T16Split::Fixed(T16_SGU, T16_SD));
+        assert_eq!(t16_split(86, Some(" 5, 2 ")).unwrap(), T16Split::Fixed(5, 2));
+        assert_eq!(t16_split(80, Some("auto")).unwrap(), T16Split::Auto);
+        for bad in ["4", "0,3", "11,3", "4,10", "a,b", "4,3,2"] {
+            assert!(t16_split(86, Some(bad)).is_err(), "{bad}");
+        }
     }
 }
