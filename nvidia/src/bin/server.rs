@@ -43,6 +43,12 @@ struct Cli {
     /// Off unless set here or through DSX_DEFER=R.
     #[arg(long)]
     defer_rank: Option<usize>,
+    /// checkpoint directory with DSpark's `mtp.*` shards (`dsx fetch-mtp DIR` downloads only those): speculative
+    /// decoding, off unless given. Drafts only while the answer repeats its prompt or itself, and only while that
+    /// measures faster; its stack (several GB, DSX_DSPARK_SLOTS) is set aside before the experts are placed, on an aux GPU with room for it
+    /// or else the main GPU. See docs/dspark.md.
+    #[arg(long)]
+    dspark: Option<std::path::PathBuf>,
     /// run the deterministic mock engine instead of the model
     #[arg(long)]
     mock: bool,
@@ -101,6 +107,10 @@ struct Cli {
     /// long system/tools prefix can replay only the divergent tail from an earlier anchor.
     #[arg(long, default_value_t = 16384)]
     prefix_anchor_tokens: usize,
+    /// forget what automatic tiering learned for this model (usage, GPU and disk measurements, SSD buffer) and start
+    /// from the shipped ranking; tiering itself needs no option (docs/tiering.md)
+    #[arg(long)]
+    tier_reset: bool,
 }
 
 #[tokio::main]
@@ -109,6 +119,9 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let mut cli = Cli::parse();
+    if cli.tier_reset {
+        dsx::tier::request_reset();
+    }
     if let Some(r) = cli.defer_rank {
         // read once by the engine (handoff::defer) before the model starts
         unsafe { std::env::set_var("DSX_DEFER", r.to_string()) };
@@ -206,6 +219,7 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
         cache_sessions: cli.cache_sessions,
         session_cache_gb: cli.session_cache_gb,
         prefix_anchor_tokens: cli.prefix_anchor_tokens,
+        dspark: cli.dspark.clone(),
     };
     EngineHandle::spawn(move || dsx::server::real::real_engine(&args))
 }

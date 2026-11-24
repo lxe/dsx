@@ -65,6 +65,16 @@ Use `--no-vision` for text only.
 computation; omit the flag to disable that approximation. See [server configuration](docs/server.md) for all options
 and [expert placement](docs/placement.md) for other memory and GPU configurations.
 
+Optional, speculative decoding with the checkpoint's draft layers (DSpark, off by default): download only those
+weights (~8 GB, resumable, SHA-256 checked) and pass the directory:
+
+```bash
+./target/release/dsx fetch-mtp dsx-mtp
+./target/release/dsx-server ... --dspark dsx-mtp
+```
+
+It drafts only while the answer repeats its prompt or itself and needs several GB of GPU memory (~8.5 GB at 32 resident draft experts, less at the default 16); see [DSpark](docs/dspark.md).
+
 Or build and run the same server in Docker (NVIDIA Container Toolkit required). The default image carries sm_86,
 sm_89 and sm_120 kernels; `--build-arg CUDA_ARCHS=86` narrows the fatbin to one GPU:
 
@@ -139,6 +149,7 @@ needs prefill. [DESIGN.md](DESIGN.md) describes the execution and memory layout.
 | [Coding agents](docs/agents.md) | Pi provider configuration |
 | [Expert placement](docs/placement.md) | GPU, RAM and disk placement; tuning for your machine |
 | [T16 format](docs/t16-format.md) | Quantization and CPU/GPU decoding |
+| [DSpark](docs/dspark.md) | Optional speculative decoding: download, when it drafts, measurements |
 | [Overlays](docs/overlays.md) | Small GGUFs that replace a few tensors at load, such as the uncensored overlay |
 | [NVIDIA runner](nvidia/README.md) | CLI tools, build details and debugging |
 | [AMD runner](amd/README.md) | The separate MI325X implementation and model |

@@ -45,6 +45,15 @@ pub struct DsparkState {
     window: Vec<Vec<Vec<f32>>>, // [layer][slot][head_dim]: main-model KV seen by each draft layer
 }
 
+/// DSX_DSPARK_DEBUG=1: norms at fixed points, for comparing the GPU port with this reference
+pub fn dbg() -> bool {
+    std::env::var_os("DSX_DSPARK_DEBUG").is_some()
+}
+
+pub fn nrm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
 fn lin(w: &Mat, x: &[f32]) -> Vec<f32> {
     let mut y = vec![0f32; w.rows];
     matvec(w, x, &mut y);
@@ -127,6 +136,9 @@ impl Dspark {
     pub fn observe(&self, m: &Model, st: &mut DsparkState, main_hidden: &[f32], pos: usize) {
         let c = &m.cfg;
         let mx = self.main_x(m, main_hidden);
+        if dbg() {
+            eprintln!("dspark-dbg cpu observe p{pos}: main_hidden {:.4} mx {:.4}", nrm(main_hidden), nrm(&mx));
+        }
         for (li, l) in self.layers.iter().enumerate() {
             let mut kv = lin(&l.kv, &mx);
             rmsnorm_inplace(&mut kv, &l.kv_norm, c.eps);
@@ -182,6 +194,9 @@ impl Dspark {
                 qs.push(q);
                 kvs.push(kv);
             }
+            if dbg() {
+                eprintln!("dspark-dbg cpu L{li}: x0 {:.4} q0 {:.4} kv0 {:.4} ring0 {:.4}", nrm(&xs[0]), nrm(&qs[0]), nrm(&kvs[0]), nrm(&st.window[li][0]));
+            }
             let rows: Vec<&Vec<f32>> = st.window[li][..nwin].iter().chain(kvs.iter()).collect();
             let scale = 1.0 / (hd as f32).sqrt();
             let mut outs = vec![];
@@ -217,6 +232,9 @@ impl Dspark {
                 let (_, post, comb) = &mixes_a[i];
                 h[i] = hc_post(c, &outs[i], &res[i], post, comb);
             }
+            if dbg() {
+                eprintln!("dspark-dbg cpu L{li}: attn out0 {:.4} h0 {:.4} h4 {:.4}", nrm(&outs[0]), nrm(&h[0]), nrm(&h[b - 1]));
+            }
             // ffn half, per token
             for i in 0..b {
                 let res = h[i].clone();
@@ -227,6 +245,9 @@ impl Dspark {
                 let y = self.moe(m, l, &x);
                 h[i] = hc_post(c, &y, &res, &f_post, &f_comb);
                 pre_mix[i] = f_pre;
+            }
+            if dbg() {
+                eprintln!("dspark-dbg cpu L{li}: layer out h0 {:.4} h4 {:.4}", nrm(&h[0]), nrm(&h[b - 1]));
             }
             let _ = li;
         }
@@ -244,6 +265,9 @@ impl Dspark {
                 *lg += bv;
             }
             let best = logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (j, &v)| if v > a.1 { (j, v) } else { a }).0;
+            if dbg() {
+                eprintln!("dspark-dbg cpu head {i}: x {:.4} best {best} logit {:.4}", nrm(&x), logits[best]);
+            }
             out.push(best as u32);
             let mut cat = x.clone();
             cat.extend_from_slice(&emb);

@@ -51,6 +51,7 @@ performed locally; benchmark numbers are not part of this change.
 | | |
 |---|---|
 | `--defer-rank R` | add the CPU's lower-ranked experts (router rank R or lower, 0 = best of 6) one layer later instead of waiting for them. T16 decode eval: KL ~0.208 → 0.237 at R=3; R=2/1 raised it to 0.260/0.306 and were rejected. Off by default; the quick start opts into R=3. Speed depends on build and text; see [measurement status](current-state.md) |
+| `--dspark DIR` | speculative decoding with the checkpoint's draft layers (`dsx fetch-mtp DIR`). Off by default; drafts only while the answer repeats its prompt or itself and only while that measures faster. Reference machine: code +7 %, prose −0.8 %; see [dspark.md](dspark.md) |
 
 Settings by machine (the flags are explained in [expert placement](placement.md)):
 

@@ -57,6 +57,8 @@ pub struct RealEngineArgs {
     pub session_cache_gb: f64,
     /// periodic sparse prefix-anchor interval in prompt tokens (`0` = anchors off)
     pub prefix_anchor_tokens: usize,
+    /// checkpoint directory holding DSpark's `mtp.*` shards: speculative decoding (None = off)
+    pub dspark: Option<PathBuf>,
 }
 
 /// Prompt-boundary snapshots kept for rewinding in the single-lineage fast path. A snapshot copies every layer's
@@ -95,6 +97,8 @@ struct Real {
     multi: Option<SessionCache>,
     stats: GenStats,
     vision: Option<VisionWeights>,
+    /// DSpark drafts and their live control (None = plain decoding)
+    spec: Option<(crate::gpumodel::DsparkGpu, crate::spec::SpecControl)>,
 }
 
 // GPU state is created and used only on the engine thread (EngineHandle::spawn builds us there).
@@ -107,9 +111,58 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
     } else {
         Model::load(&args.model, args.engram.as_deref(), args.overlay.as_deref())?
     }));
+    // DSpark: the placement leaves room for its stack on an aux GPU with memory to spare, else on the main GPU (a
+    // failure only turns it off)
+    // (with session caching too: a state switch only invalidates the draft rings; drafts never affect what is decoded)
+    let dspark_dir = args.dspark.as_deref();
+    let dspark_need = match dspark_dir.map(crate::gpumodel::DsparkGpu::estimate_bytes) {
+        Some(Ok(b)) => Some(b),
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "DSpark weights unusable: speculative decoding off");
+            None
+        }
+        None => None,
+    };
+    // learned on this machine: DSpark that has not paid for UNPAID_SKIP_TOKENS stays unloaded for SKIP_SECS (its memory
+    // goes to experts), then measures again
+    let learned = dspark_dir.and_then(|d| std::fs::read(spec_state_path(d)).ok()).and_then(|b| serde_json::from_slice::<crate::spec::Learned>(&b).ok());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let dspark_need = match (&learned, dspark_need) {
+        (Some(l), Some(_)) if l.skip_until > now => {
+            tracing::info!(event = "dspark", days_left = (l.skip_until - now) as f64 / 86400.0, "speculative decoding skipped: it did not pay on this machine; its memory goes to experts until it measures again");
+            None
+        }
+        (_, n) => n,
+    };
+    let need_gb = dspark_need.map_or(0.0, |b| b as f64 / 1e9);
     let pl = Placement { gpu0_gb: args.gpu0_gb, aux_gb: args.gpu1_gb, arena_gb: args.arena_gb, prefill_chunk: args.chunk, rank: args.rank.clone() };
     let vision = args.vision.as_deref().map(VisionWeights::load).transpose()?;
-    let gm = GpuModel::with_placement(m, -1, args.ctx, pl)?;
+    let mut gm = GpuModel::with_placement_draft(m, -1, args.ctx, pl, dspark_need.unwrap_or(0))?;
+    let spec = match (dspark_need, dspark_dir) {
+        (Some(_), Some(dir)) => match crate::gpumodel::DsparkGpu::load(&gm, dir, Some(gm.draft_gpu)) {
+            Ok(dg) => {
+                gm.capture_hidden(&dg.targets.clone())?;
+                tracing::info!(event = "dspark", gpu = dg.ordinal, gb = dg.bytes as f64 / 1e9, reserved_gb = need_gb, block = dg.block, "speculative decoding on (per token by measured gain)");
+                let mut ctl = crate::spec::SpecControl::new(dg.block);
+                if let Some(l) = &learned {
+                    ctl.resume(l);
+                    // back from a skip: measure afresh
+                    if l.skip_until > 0 {
+                        ctl.since_paid = 0;
+                        ctl.unprofitable = 0;
+                        ctl.ms_on = None;
+                        ctl.ms_off = None;
+                    }
+                }
+                Some((dg, ctl))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DSpark failed to load: speculative decoding off");
+                None
+            }
+        },
+        _ => None,
+    };
     let multi = if args.cache_sessions > 1 {
         let fingerprint = CacheContextFingerprint::build(&args.model, args.overlay.as_deref(), args.vision.as_deref(), &m.cfg, m.engram.is_some());
         let budget = (args.session_cache_gb.max(0.0) * 1e9) as usize;
@@ -134,7 +187,7 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
     } else {
         None
     };
-    Ok(Box::new(Real { gm, cached: vec![], checkpoints: Vec::new(), multi, stats: GenStats::default(), vision }))
+    Ok(Box::new(Real { gm, cached: vec![], checkpoints: Vec::new(), multi, stats: GenStats::default(), vision, spec }))
 }
 
 /// The image-aware prefix-cache key: every image span position carries the same token id, so key those positions by
@@ -200,6 +253,9 @@ impl Real {
 
         // Restore before touching the history: a failed restore leaves every checkpoint available for recovery.
         let mut saved_logits = None;
+        if let (Some((dg, _)), true) = (self.spec.as_mut(), decision.checkpoint_index.is_some() || decision.action == CacheAction::ColdReset) {
+            dg.invalidate();
+        }
         match decision.checkpoint_index {
             Some(i) => {
                 let cp = &self.checkpoints[i];
@@ -235,6 +291,9 @@ impl Real {
             let pb = self.gm.pb.take().expect("prefill buffers");
             let r = self.gm.prefill(&pb, &prompt[decision.start..]);
             self.gm.pb = Some(pb);
+            if let (Ok(_), Some((dg, _))) = (&r, self.spec.as_mut()) {
+                dg.observe_prefill(&self.gm)?;
+            }
             r
         };
         self.gm.images.clear();
@@ -253,37 +312,10 @@ impl Real {
         cached(decision.start);
         let td = Instant::now();
         let mut sampler = Sampler::from_params(p);
-        let mut fin = Finish::Length;
         let mut hes = p.hesitation.clone();
-        let mut raw = logits;
-        for _ in 0..p.max_new {
-            // raw model logits stay untouched; the hesitation penalty only mutates this token's sampling copy
-            let tok = match &hes {
-                Some(h) => {
-                    let mut sampling = raw.clone();
-                    for &i in h.ids.iter() {
-                        if let Some(l) = sampling.get_mut(i as usize) {
-                            *l -= h.lambda;
-                        }
-                    }
-                    sampler.sample(&sampling)
-                }
-                None => sampler.sample(&raw),
-            };
-            if hes.as_ref().is_some_and(|h| tok == h.close) {
-                hes = None;
-            }
-            if !emit(tok) {
-                fin = Finish::Cancelled;
-                break;
-            }
-            if self.gm.pos + 1 >= self.gm.max_ctx() {
-                break;
-            }
-            raw = self.gm.step(tok)?;
-            if profile { profile_steps += 1; }
-            self.cached.push(tok);
-        }
+        let mut cached_push = |t: u32, _pos: usize| self.cached.push(t);
+        let (fin, _raw, steps) = decode_tokens(&mut self.gm, self.spec.as_mut(), &mut sampler, &mut hes, logits, p.max_new, p.images.is_empty(), emit, &mut cached_push, prompt)?;
+        profile_steps += if profile { steps } else { 0 };
         self.stats = GenStats { prefill: Some(prefill), decode: Some(td.elapsed()), cached_prompt_tokens: decision.start };
         if let Some((busy0, picks0, split0)) = counters0 {
             let picks1 = self.gm.cpu_picks();
@@ -313,7 +345,7 @@ impl Real {
     fn generate_multi(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
         // Take the manager out so the GPU model and the cache can be borrowed independently.
         let mut cache = self.multi.take().expect("multi cache");
-        let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, prompt, p, cached, emit);
+        let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, self.spec.as_mut(), prompt, p, cached, emit);
         if r.is_err() {
             // the device state and the active lineage's `cached` tokens may disagree after a failed prefill or rewind:
             // forget that lineage so the next request restores a parked session or prefills cold
@@ -334,11 +366,21 @@ impl Engine for Real {
     }
 
     fn generate_reporting(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+        // tiering: a request (its prefill too) is busy time; background copies and warming wait until it is over
+        let _busy = crate::tier::global().map(|t| t.busy());
         if self.multi.is_some() {
             self.generate_multi(prompt, p, cached, emit)
         } else {
             self.generate_single(prompt, p, cached, emit)
         }
+    }
+
+    fn idle(&mut self) -> bool {
+        // a failed slice only stops this round of moves (logged); the next request runs as usual
+        self.gm.tier_idle().unwrap_or_else(|e| {
+            eprintln!("tier: pause slice failed: {e:#}");
+            false
+        })
     }
 
     fn last_stats(&self) -> GenStats {
@@ -513,12 +555,15 @@ fn multi_request(
     gm: &mut GpuModel<'static>,
     vision: Option<&VisionWeights>,
     cache: &mut SessionCache,
+    mut spec: Option<&mut (crate::gpumodel::DsparkGpu, crate::spec::SpecControl)>,
     prompt: &[u32],
     p: &GenParams,
     cached: &mut dyn FnMut(usize),
     emit: &mut dyn FnMut(u32) -> bool,
 ) -> Result<(Finish, GenStats)> {
     let t0 = Instant::now();
+    // DSpark: if the state below moves (park/restore/rewind/reset), the draft rings no longer describe it
+    let pos_before = gm.pos;
     anyhow::ensure!(!prompt.is_empty(), "empty prompt");
     let key = prompt_key(prompt, &p.images);
     cache.begin_request();
@@ -771,6 +816,11 @@ fn multi_request(
         gm.images.push((im.start, rows));
     }
 
+    if let Some((dg, _)) = spec.as_deref_mut() {
+        if gm.pos != pos_before {
+            dg.invalidate();
+        }
+    }
     // ---- prefill only the uncached tail (or reuse saved raw logits) ----
     let mut anchors: Vec<(usize, HostRewindState)> = Vec::new();
     let logits = if usable_start == prompt.len() {
@@ -783,6 +833,9 @@ fn multi_request(
         let existing = if mutated { session_id.and_then(|id| cache.session(id)).map_or(0, |s| s.anchors.len()) } else { 0 };
         let (l, a) = prefill_with_anchors(gm, &mut cache.arena, &prompt[usable_start..], cache.anchor_interval, existing, cache.max_anchors)?;
         anchors = a;
+        if let Some((dg, _)) = spec.as_deref_mut() {
+            dg.observe_prefill(gm)?;
+        }
         l
     };
     gm.images.clear();
@@ -851,43 +904,17 @@ fn multi_request(
     cached(usable_start);
     let td = Instant::now();
     let mut sampler = Sampler::from_params(p);
-    let mut fin = Finish::Length;
     let mut hes = p.hesitation.clone();
-    let mut raw = logits;
-    let mut generated = 0usize;
-    for _ in 0..p.max_new {
-        let tok = match &hes {
-            Some(h) => {
-                let mut sampling = raw.clone();
-                for &i in h.ids.iter() {
-                    if let Some(l) = sampling.get_mut(i as usize) {
-                        *l -= h.lambda;
-                    }
-                }
-                sampler.sample(&sampling)
-            }
-            None => sampler.sample(&raw),
-        };
-        if hes.as_ref().is_some_and(|h| tok == h.close) {
-            hes = None;
-        }
-        if !emit(tok) {
-            fin = Finish::Cancelled;
-            break;
-        }
-        // a token that never went through `step` (cancelled or context full) is not part of the model state
-        if gm.pos + 1 >= gm.max_ctx() {
-            break;
-        }
-        raw = gm.step(tok)?;
-        generated += 1;
+    let images_empty = p.images.is_empty();
+    let mut push = |tok: u32, pos: usize| {
         if let Some(sid) = session_id {
             if let Some(s) = cache.session_mut(sid) {
                 s.cached.push(tok);
-                s.live_pos = gm.pos;
+                s.live_pos = pos;
             }
         }
-    }
+    };
+    let (fin, raw, generated) = decode_tokens(gm, spec, &mut sampler, &mut hes, logits, p.max_new, images_empty, emit, &mut push, prompt)?;
     let live_logits = raw;
     if let Some(sid) = session_id {
         cache.hit(sid);
@@ -994,4 +1021,216 @@ fn multi_request(
     // prefill = up to the decode loop (t0.elapsed() here would also count the whole decode)
     let stats = GenStats { prefill: Some(td.duration_since(t0)), decode: Some(td.elapsed()), cached_prompt_tokens: usable_start };
     Ok((fin, stats))
+}
+
+/// DSX_STATE_DIR (or the checkpoint directory) / dspark-control.json
+fn spec_state_path(dir: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("DSX_STATE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| dir.to_path_buf()).join("dspark-control.json")
+}
+
+/// Keep what the controller learned; after UNPAID_SKIP_TOKENS without a paying pass, the next start skips DSpark
+fn save_spec_state(dg: &crate::gpumodel::DsparkGpu, ctl: &crate::spec::SpecControl) {
+    let mut l = ctl.learned();
+    // end to end slower with drafting than without, for long enough (or no pass paid at all): give the memory back
+    if l.since_paid >= crate::spec::UNPAID_SKIP_TOKENS || l.unprofitable >= crate::spec::UNPAID_SKIP_TOKENS {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        l.skip_until = now + crate::spec::SKIP_SECS;
+    }
+    let p = spec_state_path(&dg.dir);
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(b) = serde_json::to_vec(&l) {
+        if std::fs::write(&tmp, b).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+            tracing::debug!(path = %p.display(), "dspark-control.json not written");
+        }
+    }
+}
+
+/// Decode up to `max_new` tokens from `logits`, speculatively with DSpark when `spec` is given and `spec_ok` (per token
+/// by SpecControl: 0 drafts = a plain step). `push(token, pos)` is called for every token that entered the model state.
+/// Returns how it finished, the raw logits after the last token, and how many tokens went through the model.
+#[allow(clippy::too_many_arguments)]
+fn decode_tokens(
+    gm: &mut GpuModel<'static>,
+    mut spec: Option<&mut (crate::gpumodel::DsparkGpu, crate::spec::SpecControl)>,
+    sampler: &mut Sampler,
+    hes: &mut Option<super::engine::Hesitation>,
+    logits: Vec<f32>,
+    max_new: usize,
+    spec_ok: bool,
+    emit: &mut dyn FnMut(u32) -> bool,
+    push: &mut dyn FnMut(u32, usize),
+    prompt: &[u32],
+) -> Result<(Finish, Vec<f32>, usize)> {
+    if let Some((_, ctl)) = spec.as_deref_mut() {
+        ctl.begin(prompt);
+    }
+    let mut fin = Finish::Length;
+    let mut raw = logits;
+    let mut steps = 0usize;
+        // DSpark: a token decided by speculative acceptance (a rejected draft's resample) replaces the next sample
+        let mut pending: Option<u32> = None;
+        let mut emitted = 0usize;
+        // end-to-end accounting for SpecControl::note_wall: tokens and wall time between loop turns
+        let mut wall: Option<(Instant, usize)> = None;
+        while emitted < max_new {
+            if let Some((_, ctl)) = spec.as_deref_mut() {
+                let now = Instant::now();
+                if let Some((t, e)) = wall {
+                    ctl.note_wall(emitted - e, (now - t).as_secs_f64() * 1e3);
+                }
+                wall = Some((now, emitted));
+            }
+            // raw model logits stay untouched; the hesitation penalty only mutates this token's sampling copy
+            let penalized = |raw: &Vec<f32>, hes: &Option<_>| -> Option<Vec<f32>> {
+                let h: &super::engine::Hesitation = hes.as_ref()?;
+                let mut sampling = raw.clone();
+                for &i in h.ids.iter() {
+                    if let Some(l) = sampling.get_mut(i as usize) {
+                        *l -= h.lambda;
+                    }
+                }
+                Some(sampling)
+            };
+            let tok = match pending.take() {
+                Some(t) => t,
+                None => match penalized(&raw, &*hes) {
+                    Some(s) => sampler.sample(&s),
+                    None => sampler.sample(&raw),
+                },
+            };
+            if hes.as_ref().is_some_and(|h| tok == h.close) {
+                *hes = None;
+            }
+            if !emit(tok) {
+                fin = Finish::Cancelled;
+                break;
+            }
+            emitted += 1;
+            if let Some((_, ctl)) = spec.as_deref_mut() {
+                ctl.note_token(tok);
+            }
+            if gm.pos + 1 >= gm.max_ctx() {
+                break;
+            }
+            // draft length by measured gain (0 = a plain step); room for the drafts within max_new and the context
+            let room = (max_new - emitted).min(gm.max_ctx().saturating_sub(gm.pos + 2)).min(crate::handoff::MAXT - 1);
+            let want = match spec.as_deref_mut() {
+                Some((_, ctl)) if gm.pos > 0 && spec_ok => ctl.choose(room),
+                _ => 0,
+            };
+            let drafted = match (want, spec.as_deref_mut()) {
+                (0, _) | (_, None) => None,
+                (_, Some((dg, _))) => {
+                    // the rings' backlog since the last draft (after a plain stretch up to a window of rows) is not
+                    // per-draft cost: outside the draft timing
+                    if let Err(e) = dg.catch_up(&*gm, gm.pos - 1) {
+                        tracing::debug!(error = %e, "draft catch-up");
+                    }
+                    let td0 = Instant::now();
+                    match dg.draft(&*gm, gm.pos - 1, tok) {
+                        Ok((d, c)) => Some((d, c, td0.elapsed().as_secs_f64() * 1e3)),
+                        Err(e) => {
+                            // the rings do not cover this position (a restore without prefill): plain until observed
+                            tracing::debug!(error = %e, "no draft");
+                            None
+                        }
+                    }
+                }
+            };
+            // DSpark's confidence per position cuts drafts it would mostly lose. At least one is verified: a plain step
+            // right after a draft hung the decode on an RTX 3090 + CMP 170HX (R213, fresh controller state), so a draft
+            // is always followed by its verify pass as before
+            let drafted = drafted.map(|(d, c, dms)| {
+                let l = match spec.as_deref() {
+                    Some((_, ctl)) => ctl.cut(&c, d.len().min(want)),
+                    None => 0,
+                };
+                let l = l.max(1).min(d.len().min(want));
+                (d, c, dms, l)
+            });
+            let Some((d, conf, dms, l)) = drafted else {
+                let ts = Instant::now();
+                raw = gm.step(tok)?;
+                if let Some((dg, ctl)) = spec.as_deref_mut() {
+                    ctl.note_step(ts.elapsed().as_secs_f64() * 1e3);
+                    ctl.note_conf(crate::spec::top_prob(&raw));
+                    dg.observe(&*gm, gm.pos - 1)?;
+                }
+                steps += 1;
+                push(tok, gm.pos);
+                continue;
+            };
+            let mut toks = vec![tok];
+            toks.extend_from_slice(&d[..l]);
+            let tv = Instant::now();
+            let p0 = gm.pos;
+            let pb = gm.pb.take().expect("prefill buffers");
+            let lv = gm.verify_spec(&pb, &toks);
+            gm.pb = Some(pb);
+            let lv = lv?;
+            // exact speculative sampling: each draft is accepted with its probability under this request's sampling,
+            // the first rejection resamples from the rest (greedy: argmax agreement)
+            let mut j = 0;
+            let mut hes_v = hes.clone();
+            while j < l {
+                let (ok, t) = match penalized(&lv[j], &hes_v) {
+                    Some(s) => sampler.accept_or_resample(&s, d[j]),
+                    None => sampler.accept_or_resample(&lv[j], d[j]),
+                };
+                if !ok {
+                    pending = Some(t);
+                    break;
+                }
+                if hes_v.as_ref().is_some_and(|h| d[j] == h.close) {
+                    hes_v = None;
+                }
+                j += 1;
+            }
+            // emit the accepted drafts before committing them: a stop (stop token, max_tokens, disconnect) inside the
+            // run keeps only what was emitted, so the KV cache, the cached tokens and the saved logits stay in step
+            let mut kept = j;
+            let mut stop = false;
+            for (k, &dt) in d[..j].iter().enumerate() {
+                if hes.as_ref().is_some_and(|h| dt == h.close) {
+                    *hes = None;
+                }
+                if !emit(dt) {
+                    fin = Finish::Cancelled;
+                    stop = true;
+                    kept = k;
+                    break;
+                }
+                emitted += 1;
+                if let Some((_, ctl)) = spec.as_deref_mut() {
+                    ctl.note_token(dt);
+                }
+            }
+            gm.keep(1 + kept)?;
+            if let Some((dg, ctl)) = spec.as_deref_mut() {
+                dg.observe_span(&*gm, p0, 0, kept + 1)?;
+                for v in &lv[..=kept] {
+                    ctl.note_conf(crate::spec::top_prob(v));
+                }
+                ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
+                ctl.note_cut(&conf, l, j);
+            }
+            gm.after_pass(1 + kept)?;
+            if let Some((dg, _)) = spec.as_deref_mut() {
+                dg.maintain(&*gm)?;
+            }
+            steps += 1 + kept;
+            push(tok, gm.pos);
+            for &dt in &d[..kept] {
+                push(dt, gm.pos);
+            }
+            // the logits after the last kept token
+            raw = lv[kept].clone();
+            if stop {
+                break;
+            }
+        }
+    if let Some((dg, ctl)) = spec.as_deref() {
+        save_spec_state(dg, ctl);
+    }
+    Ok((fin, raw, steps))
 }

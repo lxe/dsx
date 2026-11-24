@@ -19,6 +19,92 @@ pub fn check(r: cu::CUresult, what: &str) -> Result<()> {
 }
 
 const KERNEL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx.fatbin"));
+/// the same kernels compiled with --fmad=false (separate multiply and add)
+const KERNEL_IMAGE_NOFMA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx_nofma.fatbin"));
+
+/// GPU ordinals that load the kernels without fused multiply-add (a GPU that throttles FFMA, like a CMP 170HX, runs the
+/// decode GEMVs faster without it). Off unless asked for: `DSX_NOFMA=1,2` by hand, `DSX_NOFMA=auto` for what
+/// `pick_kernels` measured. Needs the second kernel image, built only with the `nofma` feature.
+static NOFMA: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
+fn nofma_for(ordinal: i32) -> bool {
+    let want = match std::env::var("DSX_NOFMA") {
+        Ok(v) if v.trim() == "auto" => NOFMA.get().is_some_and(|l| l.contains(&ordinal)),
+        Ok(v) => v.split(',').any(|s| s.trim().parse::<i32>().ok() == Some(ordinal)),
+        Err(_) => false,
+    };
+    if want && KERNEL_IMAGE_NOFMA.is_empty() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| eprintln!("DSX_NOFMA: this build has no kernels without FMA (cargo feature `nofma`); using the FMA kernels"));
+        return false;
+    }
+    want
+}
+
+/// whether this build carries the kernels without FMA (cargo feature `nofma`)
+pub fn has_nofma() -> bool {
+    !KERNEL_IMAGE_NOFMA.is_empty()
+}
+
+/// Per GPU, time an attention-sized Q8 decode GEMV with both kernel images and keep the faster one (without FMA only when
+/// it is at least 3 % faster). Only with `DSX_NOFMA=auto`; once per process, before the model's contexts load their kernels.
+pub fn pick_kernels(ordinals: &[i32]) -> Result<()> {
+    if NOFMA.get().is_some() || std::env::var("DSX_NOFMA").map_or(true, |v| v.trim() != "auto") || KERNEL_IMAGE_NOFMA.is_empty() {
+        return Ok(());
+    }
+    let mut pick = vec![];
+    for &o in ordinals {
+        let (rows, cols) = (8192usize, 5120usize);
+        // both images side by side, measured alternately after a warm-up: an idle GPU starts at a low clock and ramps
+        // within ~100 ms (the first try timed both images at the same low clock and could not tell them apart)
+        struct Bench {
+            g: Gpu,
+            k: Kernel,
+            w: Buf,
+            s: Buf,
+            x: Buf,
+            y: Buf,
+        }
+        let mk = |nofma: bool| -> Result<Bench> {
+            let g = Gpu::new_with(o, nofma)?;
+            let w = g.alloc(rows * cols)?;
+            g.memset(w.ptr, rows * cols)?;
+            let s = g.upload(&vec![0x1c00u16; rows * cols / 32])?;
+            let x = g.alloc_zeroed(cols * 4)?;
+            let y = g.alloc_zeroed(rows * 4)?;
+            let k = g.kernel("gemv_q8r")?;
+            Ok(Bench { g, k, w, s, x, y })
+        };
+        let run = |b: &Bench, m: usize| -> Result<f64> {
+            b.g.sync()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..m {
+                b.g.launch(b.k, ((rows as u32).div_ceil(4), 1, 1), 128, 0, &[Arg::P(b.w.ptr), Arg::P(b.x.ptr), Arg::P(b.y.ptr), Arg::I(rows as i32), Arg::I(cols as i32), Arg::I(1), Arg::I(cols as i32), Arg::I(rows as i32), Arg::P(b.s.ptr)])?;
+            }
+            b.g.sync()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e6 / m as f64)
+        };
+        let bs = [mk(false)?, mk(true)?];
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_millis() < 300 {
+            run(&bs[0], 20)?;
+            run(&bs[1], 20)?;
+        }
+        let mut us = [f64::MAX; 2];
+        for _ in 0..6 {
+            for i in 0..2 {
+                us[i] = us[i].min(run(&bs[i], 40)?);
+            }
+        }
+        let faster = us[1] < 0.97 * us[0];
+        eprintln!("GPU{o}: decode GEMV {:.1} us with FMA, {:.1} us without: kernels {}", us[0], us[1], if faster { "without FMA" } else { "as built" });
+        if faster {
+            pick.push(o);
+        }
+    }
+    let _ = NOFMA.set(pick);
+    Ok(())
+}
 
 /// Device memory, freed on drop.
 pub struct Buf {
@@ -35,6 +121,24 @@ impl Drop for Buf {
                 cu::cuMemFree_v2(self.ptr);
             }
         }
+    }
+}
+
+/// The device's UUID as nvidia-smi prints it (`GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`): it names a GPU across
+/// CUDA_VISIBLE_DEVICES orders and runs (tiering keeps measurements per GPU by it).
+pub fn uuid(ordinal: i32) -> String {
+    unsafe {
+        let mut dev = 0;
+        let mut u: cu::CUuuid = std::mem::zeroed();
+        if cu::cuInit(0) != cu::CUresult::CUDA_SUCCESS
+            || cu::cuDeviceGet(&mut dev, ordinal) != cu::CUresult::CUDA_SUCCESS
+            || cu::cuDeviceGetUuid_v2(&mut u, dev) != cu::CUresult::CUDA_SUCCESS
+        {
+            return format!("GPU-ordinal-{ordinal}");
+        }
+        let b: Vec<u8> = u.bytes.iter().map(|&c| c as u8).collect();
+        let h = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
+        format!("GPU-{}-{}-{}-{}-{}", h(0..4), h(4..6), h(6..8), h(8..10), h(10..16))
     }
 }
 
@@ -71,7 +175,13 @@ unsafe impl Send for Gpu {}
 
 impl Gpu {
     pub fn new(ordinal: i32) -> Result<Gpu> {
-        if KERNEL_IMAGE.is_empty() {
+        Self::new_with(ordinal, nofma_for(ordinal))
+    }
+
+    /// `nofma`: load the kernels compiled without fused multiply-add
+    pub fn new_with(ordinal: i32, nofma: bool) -> Result<Gpu> {
+        let kimage: &[u8] = if nofma { KERNEL_IMAGE_NOFMA } else { KERNEL_IMAGE };
+        if kimage.is_empty() {
             bail!("built without the `cuda` feature: no kernels");
         }
         unsafe {
@@ -100,8 +210,8 @@ impl Gpu {
             let mut par = std::ptr::null_mut();
             check(cu::cuStreamCreate(&mut par, cu::CUstream_flags::CU_STREAM_NON_BLOCKING as u32), "cuStreamCreate")?;
             let image = {
-                let mut v = vec![0u64; KERNEL_IMAGE.len().div_ceil(8)];
-                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, KERNEL_IMAGE.len()).copy_from_slice(KERNEL_IMAGE);
+                let mut v = vec![0u64; kimage.len().div_ceil(8)];
+                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, kimage.len()).copy_from_slice(kimage);
                 v
             };
             let mut module = std::ptr::null_mut();
@@ -447,6 +557,8 @@ impl Gpu {
 
     /// record `e` on the main (side = false) or side stream
     pub fn record(&self, e: Event, side: bool) -> Result<()> {
+        // the stream is this context's: another context current (a DSpark draft on an aux GPU) fails the record
+        self.bind();
         unsafe { check(cu::cuEventRecord(e.0, if side { self.side } else { self.stream }), "cuEventRecord") }
     }
 
@@ -500,6 +612,7 @@ impl Gpu {
 
     /// join: record `e` on the par stream (the main stream waits for it with `wait(e, false)`)
     pub fn record_par(&self, e: Event) -> Result<()> {
+        self.bind();
         unsafe { check(cu::cuEventRecord(e.0, self.par), "cuEventRecord") }
     }
 
