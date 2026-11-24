@@ -603,6 +603,10 @@ impl GpuModel<'_> {
     }
 
     pub(super) fn prefill_pass(&mut self, pb: &PrefillBufs, tokens: &[u32], last: bool, all_logits: bool) -> Result<Option<Vec<Vec<f32>>>> {
+        // tiering: prefill is busy time (no page-cache warming or SSD copies beside it)
+        if let Some(t) = self.tier {
+            t.note_busy();
+        }
         self.adapt_flush()?;
         if pb.stage_off.get() > 0 {
             // the previous pass's staged uploads may still be in flight

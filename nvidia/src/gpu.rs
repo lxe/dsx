@@ -38,6 +38,24 @@ impl Drop for Buf {
     }
 }
 
+/// The device's UUID as nvidia-smi prints it (`GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`): it names a GPU across
+/// CUDA_VISIBLE_DEVICES orders and runs (tiering keeps measurements per GPU by it).
+pub fn uuid(ordinal: i32) -> String {
+    unsafe {
+        let mut dev = 0;
+        let mut u: cu::CUuuid = std::mem::zeroed();
+        if cu::cuInit(0) != cu::CUresult::CUDA_SUCCESS
+            || cu::cuDeviceGet(&mut dev, ordinal) != cu::CUresult::CUDA_SUCCESS
+            || cu::cuDeviceGetUuid_v2(&mut u, dev) != cu::CUresult::CUDA_SUCCESS
+        {
+            return format!("GPU-ordinal-{ordinal}");
+        }
+        let b: Vec<u8> = u.bytes.iter().map(|&c| c as u8).collect();
+        let h = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
+        format!("GPU-{}-{}-{}-{}-{}", h(0..4), h(4..6), h(6..8), h(8..10), h(10..16))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Kernel(cu::CUfunction);
 unsafe impl Send for Kernel {}

@@ -334,11 +334,21 @@ impl Engine for Real {
     }
 
     fn generate_reporting(&mut self, prompt: &[u32], p: &GenParams, cached: &mut dyn FnMut(usize), emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
+        // tiering: a request (its prefill too) is busy time; background copies and warming wait until it is over
+        let _busy = crate::tier::global().map(|t| t.busy());
         if self.multi.is_some() {
             self.generate_multi(prompt, p, cached, emit)
         } else {
             self.generate_single(prompt, p, cached, emit)
         }
+    }
+
+    fn idle(&mut self) -> bool {
+        // a failed slice only stops this round of moves (logged); the next request runs as usual
+        self.gm.tier_idle().unwrap_or_else(|e| {
+            eprintln!("tier: pause slice failed: {e:#}");
+            false
+        })
     }
 
     fn last_stats(&self) -> GenStats {
