@@ -72,7 +72,9 @@ jobs:
   # CUDA 13.x is needed for sm_120 (RTX 5090); the action installs only nvcc + cudart headers.
   cuda-compile:
     name: compile CUDA feature (nvcc, no GPU)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'orble-4' }}
+    # Stays on GitHub's Ubuntu runner: Jimver/cuda-toolkit adds NVIDIA's Ubuntu apt repository, which Orble's Debian
+    # runner image can't use.
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
