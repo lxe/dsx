@@ -29,7 +29,7 @@ jobs:
   # amd only compiles here: linking dsx-amd needs libamdhip64/libhipblas from /opt/rocm.
   check:
     name: build (workspace, no GPU)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'orble-4' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -52,7 +52,7 @@ jobs:
   # (hosted runners) but not on tmpfs. If it ever flakes, append -- --skip rows_land_in_place_every_token.
   test:
     name: cargo test (CPU)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'orble-4' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -72,6 +72,8 @@ jobs:
   # CUDA 13.x is needed for sm_120 (RTX 5090); the action installs only nvcc + cudart headers.
   cuda-compile:
     name: compile CUDA feature (nvcc, no GPU)
+    # Stays on GitHub's Ubuntu runner: Jimver/cuda-toolkit adds NVIDIA's Ubuntu apt repository, which Orble's Debian
+    # runner image can't use.
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
